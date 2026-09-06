@@ -52,7 +52,7 @@ app.post("/webhook", (req, res) => {
     for (const change of changes) {
       if (change.field === "comments") {
         handleComment(change.value);
-      }
+      } else if (change.field === "messages") { handleDirectMessage(change.value); }
     }
   }
 });

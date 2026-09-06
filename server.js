@@ -281,6 +281,7 @@ try {
                     },
                 },
             },
+        },
             {
             params: { access_token: PAGE_ACCESS_TOKEN },
         }

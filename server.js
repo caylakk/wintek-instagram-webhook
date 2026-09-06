@@ -1,34 +1,73 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
+const Anthropic = require("@anthropic-ai/sdk");
+const { Redis } = require("@upstash/redis");
 
 const app = express();
 app.use(express.json());
 
-// ───────────────────────── Env vars ─────────────────────────
 const {
     PAGE_ACCESS_TOKEN,
     VERIFY_TOKEN,
     IG_BUSINESS_ACCOUNT_ID,
+    ANTHROPIC_API_KEY,
+    UPSTASH_REDIS_REST_URL,
+    UPSTASH_REDIS_REST_TOKEN,
     PORT = 3000,
 } = process.env;
 
-// ───────────────────────── GET /webhook — Doğrulama ─────────────────────────
+const WHATSAPP_NUMBER_DISPLAY = "+90 533 556 62 10";
+
+const anthropic = ANTHROPIC_API_KEY
+? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
+    : null;
+
+const redis =
+    UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN
+? new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
+    : null;
+
+if (!anthropic) {
+    console.warn("ANTHROPIC_API_KEY tanimli degil - sabit yanit kullanilacak.");
+}
+if (!redis) {
+    console.warn("Upstash Redis bilgileri eksik - konusma gecmisi saklanmayacak.");
+}
+
+const CLAUDE_MODEL = "claude-sonnet-4-5-20250929";
+const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 7;
+const MAX_HISTORY_MESSAGES = 12;
+const FALLBACK_REPLY =
+    "Merhaba! Mesajınız için teşekkürler, en kısa sürede döneceğiz.";
+
+const SYSTEM_PROMPT = `Sen Wintek'in Instagram hesabı için çalışan bir müşteri asistanısın. Türkçe, samimi, kısa ve net cevaplar veriyorsun.
+
+WINTEK NE SATAR:
+- İş güvenliği ve el aletleri: iş eldivenleri, matkap uçları, sanayi için (demonte) çalışma tezgahları, akülü el aletleri ve benzeri endüstriyel ürünler.
+- WINKEL markasının bayisi olarak: anaerobik ürünler (vida/boru sıkılığı için), yapıştırıcılar (metal dolgulu epoksi macunlar dahil), elastik sızdırmazlık ürünleri, yağlayıcılar (gres, pas sökücü ve anti-seize spreyler), metal kaplama/pas dönüştürücü ürünler, parça ve yüzey temizleyiciler, sprey boyalar. Bu ürünler sanayi, otomotiv ve denizcilik sektörlerine yöneliktir.
+
+KURALLAR:
+1. Ürünler, kullanım alanları ve genel bilgilerle ilgili sorulara elinden geldiğince net ve yardımcı şekilde cevap ver.
+2. STOK DURUMU veya KESİN FİYAT sorulduğunda: canlı stok/fiyat sistemine erişimin olmadığını unutma, bu yüzden kesin rakam veya "stokta var/yok" bilgisi UYDURMA. Bu durumlarda nazikçe kesin teyit için şu WhatsApp numarasını öner: ${WHATSAPP_NUMBER_DISPLAY}.
+3. Alakasız, uygunsuz ya da Wintek'in işiyle ilgisi olmayan taleplerde kibarca konuyu Wintek'in ürün/hizmetlerine getir ya da gerekiyorsa WhatsApp numarasına yönlendir.
+4. Yanıtların Instagram DM/yorum ortamına uygun olsun: kısa (1-4 cümle), gereksiz uzatmadan, doğal bir müşteri temsilcisi tonunda. Emoji kullanımı ölçülü olsun, abartma.
+5. Kendini yapay zeka olarak tanıtmana gerek yok, Wintek adına yazan doğal bir temsilci gibi davran.`;
+
 app.get("/webhook", (req, res) => {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
 
-          if (mode === "subscribe" && token === VERIFY_TOKEN) {
-                console.log("✅ Webhook doğrulandı.");
-                return res.status(200).send(challenge);
-          }
+        if (mode === "subscribe" && token === VERIFY_TOKEN) {
+            console.log("Webhook dogrulandi.");
+            return res.status(200).send(challenge);
+        }
 
-          console.warn("⚠️ Webhook doğrulama başarısız. Token eşleşmedi.");
+        console.warn("Webhook dogrulama basarisiz. Token eslesmedi.");
     return res.status(403).send("Forbidden");
 });
 
-// ───────────────────────── GET /privacy — Gizlilik Politikası ─────────────────────────
 app.get("/privacy", (req, res) => {
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(`<!DOCTYPE html>
@@ -53,11 +92,11 @@ app.get("/privacy", (req, res) => {
     <li>Gonderilen mesaj veya yorumun metin icerigi</li>
     </ul>
     <h2>Veriler Ne Amacla Kullanilir?</h2>
-    <p>Bu veriler yalnizca gelen mesaj/yoruma otomatik bir karsilama yaniti gondermek amaciyla, Meta/Instagram Graph API uzerinden anlik olarak islenir. Veriler pazarlama, profil olusturma veya ucuncu taraflarla paylasim amaciyla kullanilmaz.</p>
+    <p>Bu veriler, gelen mesaj/yoruma anlamli ve baglamsal bir yanit uretmek amaciyla Meta/Instagram Graph API ve Anthropic Claude API uzerinden islenir. Konusma baglamini surdurebilmek icin son mesajlar, kullaniciya ozel olarak, sifreli bir bulut veritabaninda (Upstash Redis) en fazla 7 gun sureyle saklanir ve bu surenin sonunda otomatik olarak silinir. Veriler pazarlama, profil olusturma veya ucuncu taraflarla paylasim amaciyla kullanilmaz.</p>
     <h2>Veri Saklama</h2>
-    <p>Islenen mesaj icerikleri kalici bir veritabaninda saklanmaz. Sunucu calisma gunluklerinde (log) teknik hata ayiklama amaciyla kisa sureligine tutulabilir ve duzenli olarak temizlenir.</p>
+    <p>Konusma gecmisi en fazla 7 gun saklanip otomatik silinir. Sunucu calisma gunluklerinde (log) teknik hata ayiklama amaciyla kisa sureligine tutulabilir ve duzenli olarak temizlenir.</p>
     <h2>Ucuncu Taraflarla Paylasim</h2>
-    <p>Toplanan veriler, yanit gonderme islemini gerceklestirmek icin gereken Meta/Instagram Graph API cagrilari disinda hicbir ucuncu tarafla paylasilmaz veya satilmaz.</p>
+    <p>Toplanan veriler, yanit gonderme islemini gerceklestirmek icin gereken Meta/Instagram Graph API ve yaniti olusturmak icin gereken Anthropic Claude API cagrilari disinda hicbir ucuncu tarafla paylasilmaz veya satilmaz.</p>
     <h2>Veri Silme Talepleri</h2>
     <p>Verilerinizin silinmesini talep etmek icin asagidaki iletisim adresinden bize ulasabilirsiniz.</p>
     <h2>Iletisim</h2>
@@ -67,126 +106,160 @@ app.get("/privacy", (req, res) => {
     </html>`);
 });
 
-// ───────────────────────── POST /webhook — Olaylar ─────────────────────────
 app.post("/webhook", (req, res) => {
-    // Meta'nın timeout'a düşmemesi için hemen 200 döndür
-           res.status(200).send("EVENT_RECEIVED");
+    res.status(200).send("EVENT_RECEIVED");
 
-           const body = req.body;
-    console.log("📥 RAW webhook body:", JSON.stringify(body));
+         const body = req.body;
+    console.log("RAW webhook body:", JSON.stringify(body));
 
-           if (body.object !== "instagram") return;
+         if (body.object !== "instagram") return;
 
-           const entries = body.entry || [];
+         const entries = body.entry || [];
 
-           for (const entry of entries) {
-                 // ── DM (Direct Message) işleme ──
-      const messagingEvents = entry.messaging || [];
-                 for (const event of messagingEvents) {
-                         handleDirectMessage(event);
+         for (const entry of entries) {
+             const messagingEvents = entry.messaging || [];
+             for (const event of messagingEvents) {
+                 handleDirectMessage(event);
+             }
+
+    const changes = entry.changes || [];
+             for (const change of changes) {
+                 if (change.field === "comments") {
+                     handleComment(change.value);
+                 } else if (change.field === "messages") {
+                     handleDirectMessage(change.value);
                  }
-
-      // ── Yorum (Comment) işleme ──
-      const changes = entry.changes || [];
-                 for (const change of changes) {
-                         if (change.field === "comments") {
-                                   handleComment(change.value);
-                         } else if (change.field === "messages") { handleDirectMessage(change.value); }
-                 }
-           }
+             }
+         }
 });
 
-// ───────────────────────── DM İşleme ─────────────────────────
-function handleDirectMessage(event) {
+async function getHistory(historyKey) {
+    if (!redis) return [];
+    try {
+        const data = await redis.get(historyKey);
+        return Array.isArray(data) ? data : [];
+    } catch (err) {
+        console.error("Redis okuma hatasi:", err.message);
+        return [];
+    }
+}
+
+async function saveHistory(historyKey, history) {
+    if (!redis) return;
+    try {
+        const trimmed = history.slice(-MAX_HISTORY_MESSAGES);
+        await redis.set(historyKey, trimmed, { ex: HISTORY_TTL_SECONDS });
+    } catch (err) {
+        console.error("Redis yazma hatasi:", err.message);
+    }
+}
+
+async function generateAIReply(historyKey, userText, maxTokens) {
+    if (!anthropic) return FALLBACK_REPLY;
+
+const history = await getHistory(historyKey);
+    const messages = [...history, { role: "user", content: userText }];
+
+try {
+    const response = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: maxTokens,
+        system: SYSTEM_PROMPT,
+        messages,
+    });
+
+    const replyText = (response.content || [])
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+
+    if (!replyText) return FALLBACK_REPLY;
+
+    const updatedHistory = [...messages, { role: "assistant", content: replyText }];
+    await saveHistory(historyKey, updatedHistory);
+
+    return replyText;
+} catch (err) {
+    console.error("Claude API hatasi:", err.response?.data || err.message);
+    return FALLBACK_REPLY;
+}
+}
+
+async function handleDirectMessage(event) {
     const senderId = event.sender?.id;
     const message = event.message;
 
-  // Kendi gönderdiğimiz mesajlara tekrar cevap verme
-  if (!senderId || senderId === IG_BUSINESS_ACCOUNT_ID) return;
+if (!senderId || senderId === IG_BUSINESS_ACCOUNT_ID) return;
 
-  // Echo (yankı) mesajlarını atla
-  if (message?.is_echo) return;
+if (message?.is_echo) return;
 
-  // Sadece metin mesajlarını işle (isteğe bağlı genişletilebilir)
-  if (!message?.text) return;
+if (!message?.text) return;
 
-  console.log(`📩 DM alındı — Gönderen: ${senderId}, Mesaj: "${message.text}"`);
+console.log(`DM alindi - Gonderen: ${senderId}, Mesaj: "${message.text}"`);
 
-  sendDirectReply(senderId, "Merhaba! Mesajınız için teşekkürler, en kısa sürede döneceğiz.");
+const reply = await generateAIReply(`conv:dm:${senderId}`, message.text, 400);
+    sendDirectReply(senderId, reply);
 }
 
-// ───────────────────────── Yorum İşleme ─────────────────────────
-function handleComment(value) {
+async function handleComment(value) {
     const commentId = value?.id;
     const commenterId = value?.from?.id;
     const commentText = value?.text;
 
-  // Kendi yorumlarımıza tekrar cevap verme
-  if (!commenterId || commenterId === IG_BUSINESS_ACCOUNT_ID) return;
+if (!commenterId || commenterId === IG_BUSINESS_ACCOUNT_ID) return;
 
-  if (!commentId || !commentText) return;
+if (!commentId || !commentText) return;
 
-  console.log(`💬 Yorum alındı — Yazan: ${commenterId}, Yorum: "${commentText}"`);
+console.log(`Yorum alindi - Yazan: ${commenterId}, Yorum: "${commentText}"`);
 
-  sendCommentReply(commentId, "Merhaba! Mesajınız için teşekkürler, en kısa sürede döneceğiz.");
+const reply = await generateAIReply(`conv:comment:${commenterId}`, commentText, 150);
+    sendCommentReply(commentId, reply);
 }
 
-// ───────────────────────── Yanıt Gönderme Fonksiyonları ─────────────────────────
-
-/**
- * Instagram DM üzerinden yanıt gönderir.
- * @param {string} recipientId — Alıcının IGSID'si
- * @param {string} text — Gönderilecek mesaj metni
- */
 async function sendDirectReply(recipientId, text) {
     const url = `https://graph.instagram.com/v21.0/me/messages`;
 
-  try {
-        await axios.post(
-                url,
-          {
-                    recipient: { id: recipientId },
-                    message: { text },
-          },
-          {
-                    params: { access_token: PAGE_ACCESS_TOKEN },
-          }
-              );
-        console.log(`✅ DM yanıtı gönderildi → ${recipientId}`);
-  } catch (err) {
-        console.error(
-                `❌ DM yanıtı gönderilemedi → ${recipientId}:`,
-                err.response?.data || err.message
-              );
-  }
+try {
+    await axios.post(
+        url,
+        {
+            recipient: { id: recipientId },
+            message: { text },
+        },
+        {
+            params: { access_token: PAGE_ACCESS_TOKEN },
+        }
+        );
+    console.log(`DM yaniti gonderildi -> ${recipientId}`);
+} catch (err) {
+    console.error(
+        `DM yaniti gonderilemedi -> ${recipientId}:`,
+        err.response?.data || err.message
+        );
+}
 }
 
-/**
- * Bir Instagram yorumuna yanıt gönderir.
- * @param {string} commentId — Yanıtlanacak yorumun ID'si
- * @param {string} text — Yanıt metni
- */
 async function sendCommentReply(commentId, text) {
     const url = `https://graph.instagram.com/v21.0/${commentId}/replies`;
 
-  try {
-        await axios.post(
-                url,
-          { message: text },
-          {
-                    params: { access_token: PAGE_ACCESS_TOKEN },
-          }
-              );
-        console.log(`✅ Yorum yanıtı gönderildi → ${commentId}`);
-  } catch (err) {
-        console.error(
-                `❌ Yorum yanıtı gönderilemedi → ${commentId}:`,
-                err.response?.data || err.message
-              );
-  }
+try {
+    await axios.post(
+        url,
+        { message: text },
+        {
+            params: { access_token: PAGE_ACCESS_TOKEN },
+        }
+        );
+    console.log(`Yorum yaniti gonderildi -> ${commentId}`);
+} catch (err) {
+    console.error(
+        `Yorum yaniti gonderilemedi -> ${commentId}:`,
+        err.response?.data || err.message
+        );
+}
 }
 
-// ───────────────────────── Sunucuyu Başlat ─────────────────────────
 app.listen(PORT, () => {
-    console.log(`🚀 Webhook sunucusu http://localhost:${PORT}/webhook adresinde çalışıyor`);
+    console.log(`Webhook sunucusu http://localhost:${PORT}/webhook adresinde calisiyor`);
 });

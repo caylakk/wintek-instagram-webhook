@@ -18,6 +18,9 @@ const {
 } = process.env;
 
 const WHATSAPP_NUMBER_DISPLAY = "+90 533 556 62 10";
+const WHATSAPP_NUMBER_DIGITS = "905335566210";
+const WHATSAPP_LINK = `https://wa.me/${WHATSAPP_NUMBER_DIGITS}`;
+const WHATSAPP_BUTTON_MARKER = "[[WHATSAPP_BUTTON]]";
 
 const anthropic = ANTHROPIC_API_KEY
 ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
@@ -49,8 +52,8 @@ WINTEK NE SATAR:
 
 KURALLAR:
 1. Ürünler, kullanım alanları ve genel bilgilerle ilgili sorulara elinden geldiğince net ve yardımcı şekilde cevap ver.
-2. STOK DURUMU veya KESİN FİYAT sorulduğunda: canlı stok/fiyat sistemine erişimin olmadığını unutma, bu yüzden kesin rakam veya "stokta var/yok" bilgisi UYDURMA. Bu durumlarda nazikçe kesin teyit için şu WhatsApp numarasını öner: ${WHATSAPP_NUMBER_DISPLAY}.
-3. Alakasız, uygunsuz ya da Wintek'in işiyle ilgisi olmayan taleplerde kibarca konuyu Wintek'in ürün/hizmetlerine getir ya da gerekiyorsa WhatsApp numarasına yönlendir.
+2. STOK DURUMU veya KESİN FİYAT sorulduğunda: canlı stok/fiyat sistemine erişimin olmadığını unutma, bu yüzden kesin rakam veya "stokta var/yok" bilgisi UYDURMA. Bu durumlarda nazikçe kesin teyit için WhatsApp'tan iletişime geçmeyi öner (cevabında "WhatsApp'tan yazabilirsiniz" gibi bir ifade kullanabilirsin ama telefon numarasını asla yazma). Bu durumda, cevabının en sonuna başka hiçbir şey eklemeden tam olarak şu işareti ekle: ${WHATSAPP_BUTTON_MARKER}
+3. Alakasız, uygunsuz ya da Wintek'in işiyle ilgisi olmayan taleplerde kibarca konuyu Wintek'in ürün/hizmetlerine getir ya da gerekiyorsa yukarıdaki WhatsApp yönlendirmesini (2. kuraldaki gibi) kullan.
 4. Yanıtların Instagram DM/yorum ortamına uygun olsun: kısa (1-4 cümle), gereksiz uzatmadan, doğal bir müşteri temsilcisi tonunda. Emoji kullanımı ölçülü olsun, abartma.
 5. Kendini yapay zeka olarak tanıtmana gerek yok, Wintek adına yazan doğal bir temsilci gibi davran.`;
 
@@ -155,7 +158,7 @@ async function saveHistory(historyKey, history) {
 }
 
 async function generateAIReply(historyKey, userText, maxTokens) {
-    if (!anthropic) return FALLBACK_REPLY;
+    if (!anthropic) return { text: FALLBACK_REPLY, whatsapp: false };
 
 const history = await getHistory(historyKey);
     const messages = [...history, { role: "user", content: userText }];
@@ -168,21 +171,25 @@ try {
         messages,
     });
 
-    const replyText = (response.content || [])
+    const rawText = (response.content || [])
     .filter((block) => block.type === "text")
     .map((block) => block.text)
     .join("\n")
     .trim();
 
-    if (!replyText) return FALLBACK_REPLY;
+    if (!rawText) return { text: FALLBACK_REPLY, whatsapp: false };
 
-    const updatedHistory = [...messages, { role: "assistant", content: replyText }];
+    const whatsapp = rawText.includes(WHATSAPP_BUTTON_MARKER);
+    const cleanText = rawText.split(WHATSAPP_BUTTON_MARKER).join("").trim();
+    const finalText = cleanText || FALLBACK_REPLY;
+
+    const updatedHistory = [...messages, { role: "assistant", content: finalText }];
     await saveHistory(historyKey, updatedHistory);
 
-    return replyText;
+    return { text: finalText, whatsapp };
 } catch (err) {
     console.error("Claude API hatasi:", err.response?.data || err.message);
-    return FALLBACK_REPLY;
+    return { text: FALLBACK_REPLY, whatsapp: false };
 }
 }
 
@@ -198,8 +205,13 @@ if (!message?.text) return;
 
 console.log(`DM alindi - Gonderen: ${senderId}, Mesaj: "${message.text}"`);
 
-const reply = await generateAIReply(`conv:dm:${senderId}`, message.text, 400);
-    sendDirectReply(senderId, reply);
+const { text, whatsapp } = await generateAIReply(`conv:dm:${senderId}`, message.text, 400);
+
+if (whatsapp) {
+    sendDirectReplyWithWhatsApp(senderId, text);
+} else {
+    sendDirectReply(senderId, text);
+}
 }
 
 async function handleComment(value) {
@@ -213,8 +225,13 @@ if (!commentId || !commentText) return;
 
 console.log(`Yorum alindi - Yazan: ${commenterId}, Yorum: "${commentText}"`);
 
-const reply = await generateAIReply(`conv:comment:${commenterId}`, commentText, 150);
-    sendCommentReply(commentId, reply);
+const { text, whatsapp } = await generateAIReply(`conv:comment:${commenterId}`, commentText, 150);
+
+const finalText = whatsapp
+    ? `${text} WhatsApp: ${WHATSAPP_NUMBER_DISPLAY}`
+    : text;
+
+sendCommentReply(commentId, finalText);
 }
 
 async function sendDirectReply(recipientId, text) {
@@ -237,6 +254,44 @@ try {
         `DM yaniti gonderilemedi -> ${recipientId}:`,
         err.response?.data || err.message
         );
+}
+}
+
+async function sendDirectReplyWithWhatsApp(recipientId, text) {
+    const url = `https://graph.instagram.com/v21.0/me/messages`;
+
+try {
+    await axios.post(
+        url,
+        {
+            recipient: { id: recipientId },
+            message: {
+                attachment: {
+                    type: "template",
+                    payload: {
+                        template_type: "button",
+                        text: text.slice(0, 640),
+                        buttons: [
+                            {
+                                type: "web_url",
+                                url: WHATSAPP_LINK,
+                                title: "WhatsApp'tan Yaz",
+                            },
+                            ],
+                    },
+                },
+            },
+            {
+            params: { access_token: PAGE_ACCESS_TOKEN },
+        }
+        );
+    console.log(`DM yaniti (WhatsApp butonlu) gonderildi -> ${recipientId}`);
+} catch (err) {
+    console.error(
+        `DM yaniti (WhatsApp butonlu) gonderilemedi -> ${recipientId}:`,
+        err.response?.data || err.message
+        );
+    sendDirectReply(recipientId, `${text} WhatsApp: ${WHATSAPP_NUMBER_DISPLAY}`);
 }
 }
 

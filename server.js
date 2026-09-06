@@ -34,6 +34,7 @@ app.post("/webhook", (req, res) => {
   res.status(200).send("EVENT_RECEIVED");
 
   const body = req.body;
+  console.log("📥 RAW webhook body:", JSON.stringify(body));
 
   if (body.object !== "instagram") return;
 

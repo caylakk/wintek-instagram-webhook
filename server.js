@@ -44,6 +44,9 @@ const MAX_HISTORY_MESSAGES = 12;
 const FALLBACK_REPLY =
     "Merhaba! Mesajınız için teşekkürler, en kısa sürede döneceğiz.";
 
+const WELCOME_MESSAGE =
+    "Merhaba, Wintek'e hoş geldiniz. İş güvenliği ekipmanları ve endüstriyel el aletlerinin yanı sıra, WINKEL'in yetkili bayisi olarak sanayi, otomotiv ve denizcilik sektörlerine yönelik yapıştırıcı, yağlayıcı, sızdırmazlık ve yüzey bakım ürünleri sunuyoruz. Ürün ve hizmetlerimizle ilgili merak ettiğiniz her konuda size memnuniyetle yardımcı olalım.";
+
 const SYSTEM_PROMPT = `Sen Wintek'in Instagram hesabı için çalışan bir müşteri asistanısın. Türkçe, samimi, kısa ve net cevaplar veriyorsun.
 
 WINTEK NE SATAR:
@@ -55,7 +58,8 @@ KURALLAR:
 2. STOK DURUMU veya KESİN FİYAT sorulduğunda: canlı stok/fiyat sistemine erişimin olmadığını unutma, bu yüzden kesin rakam veya "stokta var/yok" bilgisi UYDURMA. Bu durumlarda nazikçe kesin teyit için WhatsApp'tan iletişime geçmeyi öner (cevabında "WhatsApp'tan yazabilirsiniz" gibi bir ifade kullanabilirsin ama telefon numarasını asla yazma). Bu durumda, cevabının en sonuna başka hiçbir şey eklemeden tam olarak şu işareti ekle: ${WHATSAPP_BUTTON_MARKER}
 3. Alakasız, uygunsuz ya da Wintek'in işiyle ilgisi olmayan taleplerde kibarca konuyu Wintek'in ürün/hizmetlerine getir ya da gerekiyorsa yukarıdaki WhatsApp yönlendirmesini (2. kuraldaki gibi) kullan.
 4. Yanıtların Instagram DM/yorum ortamına uygun olsun: kısa (1-4 cümle), gereksiz uzatmadan, doğal bir müşteri temsilcisi tonunda. Emoji kullanımı ölçülü olsun, abartma.
-5. Kendini yapay zeka olarak tanıtmana gerek yok, Wintek adına yazan doğal bir temsilci gibi davran.`;
+5. Kendini yapay zeka olarak tanıtmana gerek yok, Wintek adına yazan doğal bir temsilci gibi davran.
+6. Konuşmanın başında müşteriye otomatik bir karşılama mesajı zaten gönderiliyor. Bu yüzden sen ayrıca "hoş geldiniz", "merhaba" gibi bir karşılama cümlesiyle başlama; doğrudan müşterinin sorusuna veya talebine odaklan.`;
 
 app.get("/webhook", (req, res) => {
     const mode = req.query["hub.mode"];
@@ -205,7 +209,13 @@ if (!message?.text) return;
 
 console.log(`DM alindi - Gonderen: ${senderId}, Mesaj: "${message.text}"`);
 
-const { text, whatsapp } = await generateAIReply(`conv:dm:${senderId}`, message.text, 400);
+const historyKey = `conv:dm:${senderId}`;
+const existingHistory = await getHistory(historyKey);
+if (existingHistory.length === 0) {
+    await sendDirectReply(senderId, WELCOME_MESSAGE);
+}
+
+const { text, whatsapp } = await generateAIReply(historyKey, message.text, 400);
 
 if (whatsapp) {
     sendDirectReplyWithWhatsApp(senderId, text);

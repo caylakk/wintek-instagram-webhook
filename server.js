@@ -51,7 +51,13 @@ const SYSTEM_PROMPT = `Sen Wintek'in Instagram hesabı için çalışan bir mü�
 
 WINTEK NE SATAR:
 - İş güvenliği ve el aletleri: iş eldivenleri, matkap uçları, sanayi için (demonte) çalışma tezgahları, akülü el aletleri ve benzeri endüstriyel ürünler.
-- WINKEL markasının bayisi olarak: anaerobik ürünler (vida/boru sıkılığı için), yapıştırıcılar (metal dolgulu epoksi macunlar dahil), elastik sızdırmazlık ürünleri, yağlayıcılar (gres, pas sökücü ve anti-seize spreyler), metal kaplama/pas dönüştürücü ürünler, parça ve yüzey temizleyiciler, sprey boyalar. Bu ürünler sanayi, otomotiv ve denizcilik sektörlerine yöneliktir.
+- WINKEL markasının yetkili bayisi olarak (sanayi, otomotiv ve denizcilik sektörlerine yönelik):
+  * Anaerobik ürünler: vida/dişli sabitleyiciler (PRO 2W43, 2W70, 2W77 serisi), boru dişli sızdırmazlık ürünleri (PRO 5W11, 5W72, 5W77, 5W42, 5W65 serisi ve WIN-LOCK sızdırmazlık ipi), flanş sızdırmazlık ürünleri (PRO 5W18, 5W10 serisi), kenetleyici/tutturucu ürünler (PRO 6W01, 6W20, 6W38, 6W41, 6W48 serisi) — titreşime, yağa ve yüksek sıcaklığa (150-230°C) dayanıklıdır.
+  * Yapıştırıcılar: hızlı yapışan siyanoakrilat (süper) yapıştırıcılar (metal, MDF, kauçuk tipleri dahil), 2 bileşenli epoksi sistemler ve metal/çelik onarım macunları (PRO W-A, PRO Knead Steel/Water, PRO Metal Mix, ısıya dayanıklı şeffaf epoksi gibi), aşınmaya ve aside dayanıklı özel kaplamalar (PRO WINBACK serisi).
+  * Elastik sızdırmazlık ürünleri: silikon sızdırmazlıklar (universal, nötr, yüksek ısı RTV silikon), poliüretan yapıştırıcı, sıvı conta, MS polimer bazlı sızdırmazlıklar, Hylomar tipi conta macunları.
+  * Yağlayıcılar: yüksek sıcaklık gresleri (400°C-700°C'ye kadar, MoS2 içerikli), gıda sektörüne uygun (H1 sertifikalı) gresler ve silikon spreyler, deniz/gemi gresi, anti-seize bakır/alüminyum/seramik montaj pastaları, çok fonksiyonlu spreyler (yağlama + pas çözme + temizleme + nem giderme bir arada), zincir ve halat bakım spreyleri, PTFE kuru yağlayıcı sprey, grafitli gres sprey.
+  * Metal kaplama, koruma ve yüzey işlem ürünleri: pas dönüştürücüler, koruyucu metal kaplamalar ve montaj pastaları.
+  * Parça, yüzey ve el temizleyicileri; sprey boyalar.
 
 KURALLAR:
 1. Ürünler, kullanım alanları ve genel bilgilerle ilgili sorulara elinden geldiğince net ve yardımcı şekilde cevap ver.

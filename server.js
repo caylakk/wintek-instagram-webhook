@@ -58,7 +58,10 @@ function extractTag(block, tag) {
 }
 
 function extractImages(block) {
-    const matches = [...block.matchAll(/<image[^>]*>([\s\S]*?)<\/image>/gi)];
+    // (?=[\s>]) tag-siniri zorunlu kilar: <images> konteynir etiketini
+    // <image ...> ile karistirmayi onler ("s" harfi [^>]* tarafindan yutulup
+    // yanlislikla eslesmesin diye).
+    const matches = [...block.matchAll(/<image(?=[\s>])[^>]*>([\s\S]*?)<\/image>/gi)];
     return matches
         .map((m) => decodeCData(m[1]))
         .filter((url) => url && /^https?:\/\//i.test(url));
@@ -83,27 +86,9 @@ async function refreshProductCatalog() {
         const xml = typeof res.data === "string" ? res.data : String(res.data);
         productCatalog = parseProductFeed(xml);
         productsWithImages = productCatalog.filter((p) => p.images.length > 0);
-
-        const rawImageTagCount = (xml.match(/<image[^>]*>/gi) || []).length;
         console.log(
-            `Urun feed guncellendi: ${productCatalog.length} urun, ${productsWithImages.length} tanesinde foto var. (ham XML image etiketi sayisi: ${rawImageTagCount}, xml uzunluk: ${xml.length})`
+            `Urun feed guncellendi: ${productCatalog.length} urun, ${productsWithImages.length} tanesinde foto var.`
         );
-
-        const blocks = xml.match(/<product[^>]*>[\s\S]*?<\/product>/gi) || [];
-        let debugCount = 0;
-        for (const block of blocks) {
-            if (debugCount >= 6) break;
-            if (/<image[^>]*>/i.test(block)) {
-                const barcode = extractTag(block, "barcode");
-                const imgs = extractImages(block);
-                if (imgs.length === 0) {
-                    const idx = block.search(/<images[^>]*>/i);
-                    const snippet = idx >= 0 ? block.slice(idx, idx + 400) : block.slice(0, 400);
-                    console.log(`DEBUG parse-miss barcode=${barcode} snippet=${JSON.stringify(snippet)}`);
-                    debugCount++;
-                }
-            }
-        }
     } catch (err) {
         console.error("Urun feed alinamadi:", err.response?.data || err.message);
     }

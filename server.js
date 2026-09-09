@@ -38,6 +38,59 @@ if (!redis) {
     console.warn("Upstash Redis bilgileri eksik - konusma gecmisi saklanmayacak.");
 }
 
+const PRODUCT_FEED_URL = "https://winkelgroup.de/api/products/xml";
+const PRODUCT_FEED_REFRESH_MS = 6 * 60 * 60 * 1000;
+const PRODUCT_IMAGE_MARKER_REGEX = /\[\[PRODUCT_IMAGE:([A-Za-z0-9._-]+)\]\]/;
+
+let productCatalog = [];
+let productsWithImages = [];
+
+function decodeCData(raw) {
+    if (!raw) return "";
+    const match = raw.match(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/);
+    return (match ? match[1] : raw).trim();
+}
+
+function extractTag(block, tag) {
+    const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
+    const match = block.match(re);
+    return match ? decodeCData(match[1]) : "";
+}
+
+function extractImages(block) {
+    const matches = [...block.matchAll(/<image[^>]*>([\s\S]*?)<\/image>/gi)];
+    return matches
+        .map((m) => decodeCData(m[1]))
+        .filter((url) => url && /^https?:\/\//i.test(url));
+}
+
+function parseProductFeed(xml) {
+    const blocks = xml.match(/<product[^>]*>[\s\S]*?<\/product>/gi) || [];
+    return blocks
+        .map((block) => ({
+            barcode: extractTag(block, "barcode"),
+            title: extractTag(block, "title"),
+            category: extractTag(block, "categoryName"),
+            description: extractTag(block, "description"),
+            images: extractImages(block),
+        }))
+        .filter((p) => p.barcode && p.title);
+}
+
+async function refreshProductCatalog() {
+    try {
+        const res = await axios.get(PRODUCT_FEED_URL, { timeout: 20000 });
+        const xml = typeof res.data === "string" ? res.data : String(res.data);
+        productCatalog = parseProductFeed(xml);
+        productsWithImages = productCatalog.filter((p) => p.images.length > 0);
+        console.log(
+            `Urun feed guncellendi: ${productCatalog.length} urun, ${productsWithImages.length} tanesinde foto var.`
+        );
+    } catch (err) {
+        console.error("Urun feed alinamadi:", err.response?.data || err.message);
+    }
+}
+
 const CLAUDE_MODEL = "claude-sonnet-4-5-20250929";
 const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 7;
 const MAX_HISTORY_MESSAGES = 12;
@@ -47,7 +100,7 @@ const FALLBACK_REPLY =
 const WELCOME_MESSAGE =
     "Merhaba, Wintek'e hoş geldiniz. İş güvenliği ekipmanları ve endüstriyel el aletlerinin yanı sıra, WINKEL'in yetkili bayisi olarak sanayi, otomotiv ve denizcilik sektörlerine yönelik yapıştırıcı, yağlayıcı, sızdırmazlık ve yüzey bakım ürünleri sunuyoruz. Ürün ve hizmetlerimizle ilgili merak ettiğiniz her konuda size memnuniyetle yardımcı olalım.";
 
-const SYSTEM_PROMPT = `Sen Wintek'in Instagram hesabı için çalışan bir müşteri asistanısın. Türkçe, samimi, kısa ve net cevaplar veriyorsun.
+const BASE_SYSTEM_PROMPT = `Sen Wintek'in Instagram hesabı için çalışan bir müşteri asistanısın. Türkçe, samimi, kısa ve net cevaplar veriyorsun.
 
 WINTEK NE SATAR:
 - İş güvenliği ve el aletleri: iş eldivenleri, matkap uçları, sanayi için (demonte) çalışma tezgahları, akülü el aletleri ve benzeri endüstriyel ürünler.
@@ -66,6 +119,25 @@ KURALLAR:
 4. Yanıtların Instagram DM/yorum ortamına uygun olsun: kısa (1-4 cümle), gereksiz uzatmadan, doğal bir müşteri temsilcisi tonunda. Emoji kullanımı ölçülü olsun, abartma.
 5. Kendini yapay zeka olarak tanıtmana gerek yok, Wintek adına yazan doğal bir temsilci gibi davran.
 6. Konuşmanın başında müşteriye otomatik bir karşılama mesajı zaten gönderiliyor. Bu yüzden sen ayrıca "hoş geldiniz", "merhaba" gibi bir karşılama cümlesiyle başlama; doğrudan müşterinin sorusuna veya talebine odaklan.`;
+
+function buildSystemPrompt() {
+    if (productsWithImages.length === 0) {
+        return BASE_SYSTEM_PROMPT;
+    }
+
+    const lines = productsWithImages
+        .map((p) => `- [${p.barcode}] ${p.title}`)
+        .join("\n");
+
+    const catalogSection = `
+
+FOTOĞRAFI MEVCUT ÜRÜNLER (sadece bu listedeki ürünler için fotoğraf paylaşabilirsin):
+${lines}
+
+7. Müşteri yukarıdaki listede bulunan bir ürünü özellikle soruyorsa ve hangi ürünü kastettiğinden eminsen, cevabının en sonuna (varsa WhatsApp işaretinden sonra, ayrı bir satırda) tam olarak şu formatta ekle: [[PRODUCT_IMAGE:BARKOD]] — BARKOD yerine yukarıdaki listeden ilgili ürünün gerçek barkodunu yaz. Listede olmayan ya da hangi ürün olduğundan emin olmadığın durumlarda bu işareti KESİNLİKLE kullanma; bu durumda elinde o ürünün fotoğrafı olmadığını söyleyip normal şekilde yardımcı ol.`;
+
+    return `${BASE_SYSTEM_PROMPT}${catalogSection}`;
+}
 
 app.get("/webhook", (req, res) => {
     const mode = req.query["hub.mode"];
@@ -168,7 +240,7 @@ async function saveHistory(historyKey, history) {
 }
 
 async function generateAIReply(historyKey, userText, maxTokens) {
-    if (!anthropic) return { text: FALLBACK_REPLY, whatsapp: false };
+    if (!anthropic) return { text: FALLBACK_REPLY, whatsapp: false, productImageUrl: null };
 
 const history = await getHistory(historyKey);
     const messages = [...history, { role: "user", content: userText }];
@@ -177,7 +249,7 @@ try {
     const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: maxTokens,
-        system: SYSTEM_PROMPT,
+        system: buildSystemPrompt(),
         messages,
     });
 
@@ -187,19 +259,31 @@ try {
     .join("\n")
     .trim();
 
-    if (!rawText) return { text: FALLBACK_REPLY, whatsapp: false };
+    if (!rawText) return { text: FALLBACK_REPLY, whatsapp: false, productImageUrl: null };
 
     const whatsapp = rawText.includes(WHATSAPP_BUTTON_MARKER);
-    const cleanText = rawText.split(WHATSAPP_BUTTON_MARKER).join("").trim();
+    let cleanText = rawText.split(WHATSAPP_BUTTON_MARKER).join("").trim();
+
+    let productImageUrl = null;
+    const productMatch = cleanText.match(PRODUCT_IMAGE_MARKER_REGEX);
+    if (productMatch) {
+        const barcode = productMatch[1];
+        const product = productsWithImages.find((p) => p.barcode === barcode);
+        if (product && product.images.length > 0) {
+            productImageUrl = product.images[0];
+        }
+        cleanText = cleanText.replace(PRODUCT_IMAGE_MARKER_REGEX, "").trim();
+    }
+
     const finalText = cleanText || FALLBACK_REPLY;
 
     const updatedHistory = [...messages, { role: "assistant", content: finalText }];
     await saveHistory(historyKey, updatedHistory);
 
-    return { text: finalText, whatsapp };
+    return { text: finalText, whatsapp, productImageUrl };
 } catch (err) {
     console.error("Claude API hatasi:", err.response?.data || err.message);
-    return { text: FALLBACK_REPLY, whatsapp: false };
+    return { text: FALLBACK_REPLY, whatsapp: false, productImageUrl: null };
 }
 }
 
@@ -221,12 +305,16 @@ if (existingHistory.length === 0) {
     await sendDirectReply(senderId, WELCOME_MESSAGE);
 }
 
-const { text, whatsapp } = await generateAIReply(historyKey, message.text, 400);
+const { text, whatsapp, productImageUrl } = await generateAIReply(historyKey, message.text, 400);
 
 if (whatsapp) {
-    sendDirectReplyWithWhatsApp(senderId, text);
+    await sendDirectReplyWithWhatsApp(senderId, text);
 } else {
-    sendDirectReply(senderId, text);
+    await sendDirectReply(senderId, text);
+}
+
+if (productImageUrl) {
+    await sendDirectImage(senderId, productImageUrl);
 }
 }
 
@@ -312,6 +400,37 @@ try {
 }
 }
 
+async function sendDirectImage(recipientId, imageUrl) {
+    const url = `https://graph.instagram.com/v21.0/me/messages`;
+
+try {
+    await axios.post(
+        url,
+        {
+            recipient: { id: recipientId },
+            message: {
+                attachment: {
+                    type: "image",
+                    payload: {
+                        url: imageUrl,
+                        is_reusable: true,
+                    },
+                },
+            },
+        },
+        {
+            params: { access_token: PAGE_ACCESS_TOKEN },
+        }
+        );
+    console.log(`Urun fotografi gonderildi -> ${recipientId}`);
+} catch (err) {
+    console.error(
+        `Urun fotografi gonderilemedi -> ${recipientId}:`,
+        err.response?.data || err.message
+        );
+}
+}
+
 async function sendCommentReply(commentId, text) {
     const url = `https://graph.instagram.com/v21.0/${commentId}/replies`;
 
@@ -332,6 +451,10 @@ try {
 }
 }
 
-app.listen(PORT, () => {
-    console.log(`Webhook sunucusu http://localhost:${PORT}/webhook adresinde calisiyor`);
+refreshProductCatalog().finally(() => {
+    app.listen(PORT, () => {
+        console.log(`Webhook sunucusu http://localhost:${PORT}/webhook adresinde calisiyor`);
+    });
 });
+
+setInterval(refreshProductCatalog, PRODUCT_FEED_REFRESH_MS);

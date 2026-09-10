@@ -718,6 +718,7 @@ app.get("/broadcast", (req, res) => {
     <input type="text" name="imageUrl" id="imageUrl" placeholder="https://... (bos birakilabilir)">
     <button type="submit">Tum Musterilere Gonder</button>
     </form>
+    <p><a href="/panel?key=${key}">Musteri konusmalarini goruntule &rarr;</a></p>
     </body>
     </html>`);
 });
@@ -769,6 +770,145 @@ app.post("/broadcast", async (req, res) => {
     </tbody>
     </table>
     <p><a href="/broadcast?key=${key}">&larr; Yeni mesaj gonder</a></p>
+    </body>
+    </html>`);
+});
+
+async function getConversationSummaries(prefix) {
+    if (!redis) return [];
+    try {
+        const keys = await redis.keys(`${prefix}*`);
+        const summaries = await Promise.all(
+            keys.map(async (key) => {
+                const id = key.slice(prefix.length);
+                const history = await getHistory(key);
+                const last = history[history.length - 1];
+                return {
+                    id,
+                    messageCount: history.length,
+                    lastRole: last?.role || null,
+                    lastText: typeof last?.content === "string" ? last.content : "",
+                };
+            })
+        );
+        // Redis mesaj zaman damgasi tutmuyor, bu yuzden ID'ye gore alfabetik sirala.
+        return summaries.sort((a, b) => a.id.localeCompare(b.id));
+    } catch (err) {
+        console.error("Konusma ozeti alinamadi:", err.message);
+        return [];
+    }
+}
+
+function renderPanelRows(summaries, type, key) {
+    if (summaries.length === 0) {
+        return `<tr><td colspan="4">Henuz kayitli konusma yok.</td></tr>`;
+    }
+    return summaries
+        .map((s) => {
+            const preview = escapeHtml((s.lastText || "").slice(0, 80)) + (s.lastText && s.lastText.length > 80 ? "..." : "");
+            return `<tr>
+                <td>${escapeHtml(s.id)}</td>
+                <td>${s.messageCount}</td>
+                <td>${preview}</td>
+                <td><a href="/panel/${type}/${encodeURIComponent(s.id)}?key=${key}">Goruntule</a></td>
+            </tr>`;
+        })
+        .join("\n");
+}
+
+function renderConversationThread(history) {
+    if (!history || history.length === 0) {
+        return `<p>Bu musteri icin kayitli mesaj yok.</p>`;
+    }
+    return history
+        .map((m) => {
+            const who = m.role === "user" ? "Musteri" : "Bot";
+            const cls = m.role === "user" ? "msg-user" : "msg-bot";
+            const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+            return `<div class="msg ${cls}"><div class="msg-role">${who}</div><div class="msg-text">${escapeHtml(text)}</div></div>`;
+        })
+        .join("\n");
+}
+
+app.get("/panel", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const key = escapeHtml(req.query.key);
+
+    const [dmSummaries, commentSummaries] = await Promise.all([
+        getConversationSummaries("conv:dm:"),
+        getConversationSummaries("conv:comment:"),
+    ]);
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Musteri Konusmalari - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+    h1 { font-size: 1.4em; }
+    h2 { font-size: 1.1em; margin-top: 2em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.9em; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+    a { color: #1565c0; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .nav { margin-top: 24px; font-size: 0.9em; }
+    </style>
+    </head>
+    <body>
+    <h1>Instagram Musteri Konusmalari</h1>
+
+    <h2>Direkt Mesajlar (DM)</h2>
+    <table>
+    <thead><tr><th>Musteri ID</th><th>Mesaj Sayisi</th><th>Son Mesaj</th><th></th></tr></thead>
+    <tbody>${renderPanelRows(dmSummaries, "dm", key)}</tbody>
+    </table>
+
+    <h2>Gonderi Yorumlari</h2>
+    <table>
+    <thead><tr><th>Yorum Yapan ID</th><th>Mesaj Sayisi</th><th>Son Mesaj</th><th></th></tr></thead>
+    <tbody>${renderPanelRows(commentSummaries, "comment", key)}</tbody>
+    </table>
+
+    <div class="nav"><a href="/broadcast?key=${key}">&larr; Toplu mesaj sayfasina git</a></div>
+    </body>
+    </html>`);
+});
+
+app.get("/panel/:type/:id", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const { type, id } = req.params;
+    if (type !== "dm" && type !== "comment") {
+        res.status(404).send("Gecersiz konusma turu.");
+        return;
+    }
+    const key = escapeHtml(req.query.key);
+    const historyKey = `conv:${type}:${id}`;
+    const history = await getHistory(historyKey);
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Konusma - ${escapeHtml(id)}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+    h1 { font-size: 1.2em; word-break: break-all; }
+    .msg { margin: 14px 0; padding: 10px 14px; border-radius: 10px; max-width: 80%; white-space: pre-wrap; }
+    .msg-user { background: #f1f1f1; margin-right: auto; }
+    .msg-bot { background: #e3f2fd; margin-left: auto; text-align: right; }
+    .msg-role { font-size: 0.75em; color: #777; margin-bottom: 4px; }
+    a { color: #1565c0; }
+    </style>
+    </head>
+    <body>
+    <h1>Konusma: ${escapeHtml(id)}</h1>
+    <p><a href="/panel?key=${key}">&larr; Tum konusmalara don</a></p>
+    ${renderConversationThread(history)}
     </body>
     </html>`);
 });

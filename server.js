@@ -18,6 +18,7 @@ const {
     TELEGRAM_BOT_TOKEN,
     RENDER_EXTERNAL_URL,
     ADMIN_ACCESS_KEY,
+    ADMIN_TELEGRAM_CHAT_ID,
     PORT = 3000,
 } = process.env;
 
@@ -25,6 +26,7 @@ const WHATSAPP_NUMBER_DISPLAY = "+90 533 556 62 10";
 const WHATSAPP_NUMBER_DIGITS = "905335566210";
 const WHATSAPP_LINK = `https://wa.me/${WHATSAPP_NUMBER_DIGITS}`;
 const WHATSAPP_BUTTON_MARKER = "[[WHATSAPP_BUTTON]]";
+const PUBLIC_URL = RENDER_EXTERNAL_URL || "https://wintek-instagram-webhook.onrender.com";
 
 const anthropic = ANTHROPIC_API_KEY
 ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
@@ -46,6 +48,9 @@ if (!TELEGRAM_BOT_TOKEN) {
 }
 if (!ADMIN_ACCESS_KEY) {
     console.warn("ADMIN_ACCESS_KEY tanimli degil - toplu mesaj (broadcast) sayfasi pasif.");
+}
+if (!TELEGRAM_BOT_TOKEN || !ADMIN_TELEGRAM_CHAT_ID) {
+    console.warn("TELEGRAM_BOT_TOKEN ve/veya ADMIN_TELEGRAM_CHAT_ID tanimli degil - admin bildirimleri pasif.");
 }
 
 const PRODUCT_FEED_URL = "https://winkelgroup.de/api/products/xml";
@@ -330,6 +335,12 @@ const { text, whatsapp, productImageUrl } = await generateAIReply(historyKey, me
 
 if (whatsapp) {
     await sendDirectReplyWithWhatsApp(senderId, text);
+    notifyAdmin(
+        `🔔 <b>Stok/Fiyat Sorusu - Instagram DM</b>\n` +
+        `Musteri: ${escapeHtml(senderId)}\n` +
+        `Mesaj: ${escapeHtml(message.text)}\n\n` +
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+    );
 } else {
     await sendDirectReply(senderId, text);
 }
@@ -357,6 +368,15 @@ const finalText = whatsapp
     : text;
 
 sendCommentReply(commentId, finalText);
+
+if (whatsapp) {
+    notifyAdmin(
+        `🔔 <b>Stok/Fiyat Sorusu - Instagram Yorum</b>\n` +
+        `Yazan: ${escapeHtml(commenterId)}\n` +
+        `Yorum: ${escapeHtml(commentText)}\n\n` +
+        `Konusmayi gor: ${PUBLIC_URL}/panel/comment/${encodeURIComponent(commenterId)}?key=${ADMIN_ACCESS_KEY || ""}`
+    );
+}
 }
 
 async function handleTelegramMessage(update) {
@@ -386,6 +406,11 @@ const { text: replyText, whatsapp, productImageUrl } = await generateAIReply(his
 
 if (whatsapp) {
     await sendTelegramReplyWithWhatsApp(chatId, replyText);
+    notifyAdmin(
+        `🔔 <b>Stok/Fiyat Sorusu - Telegram</b>\n` +
+        `Musteri: ${escapeHtml(String(chatId))}\n` +
+        `Mesaj: ${escapeHtml(text)}`
+    );
 } else {
     await sendTelegramReply(chatId, replyText);
 }
@@ -569,8 +594,7 @@ try {
 async function setupTelegramWebhook() {
     if (!TELEGRAM_BOT_TOKEN) return;
 
-const publicUrl = RENDER_EXTERNAL_URL || "https://wintek-instagram-webhook.onrender.com";
-    const webhookUrl = `${publicUrl}/webhook/telegram`;
+    const webhookUrl = `${PUBLIC_URL}/webhook/telegram`;
 
 try {
     await axios.get(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`, {
@@ -579,6 +603,24 @@ try {
     console.log(`Telegram webhook ayarlandi -> ${webhookUrl}`);
 } catch (err) {
     console.error("Telegram webhook ayarlanamadi:", err.response?.data || err.message);
+}
+}
+
+// Onemli bir olay (stok/fiyat sorusu -> WhatsApp yonlendirmesi gibi) oldugunda
+// isletme sahibinin kendi Telegram hesabina anlik bildirim gonderir. Musteriye
+// giden mesajlardan tamamen ayri, sadece admin'e (ADMIN_TELEGRAM_CHAT_ID) gider.
+async function notifyAdmin(message) {
+    if (!TELEGRAM_BOT_TOKEN || !ADMIN_TELEGRAM_CHAT_ID) return;
+
+try {
+    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        chat_id: ADMIN_TELEGRAM_CHAT_ID,
+        text: message,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+    });
+} catch (err) {
+    console.error("Admin bildirimi gonderilemedi:", err.response?.data || err.message);
 }
 }
 

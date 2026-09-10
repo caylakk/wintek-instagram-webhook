@@ -6,6 +6,7 @@ const { Redis } = require("@upstash/redis");
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const {
     PAGE_ACCESS_TOKEN,
@@ -16,6 +17,7 @@ const {
     UPSTASH_REDIS_REST_TOKEN,
     TELEGRAM_BOT_TOKEN,
     RENDER_EXTERNAL_URL,
+    ADMIN_ACCESS_KEY,
     PORT = 3000,
 } = process.env;
 
@@ -41,6 +43,9 @@ if (!redis) {
 }
 if (!TELEGRAM_BOT_TOKEN) {
     console.warn("TELEGRAM_BOT_TOKEN tanimli degil - Telegram entegrasyonu pasif.");
+}
+if (!ADMIN_ACCESS_KEY) {
+    console.warn("ADMIN_ACCESS_KEY tanimli degil - toplu mesaj (broadcast) sayfasi pasif.");
 }
 
 const PRODUCT_FEED_URL = "https://winkelgroup.de/api/products/xml";
@@ -576,6 +581,197 @@ try {
     console.error("Telegram webhook ayarlanamadi:", err.response?.data || err.message);
 }
 }
+
+function escapeHtml(str) {
+    return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getAllInstagramCustomerIds() {
+    if (!redis) return [];
+    try {
+        const keys = await redis.keys("conv:dm:*");
+        return keys.map((k) => k.replace(/^conv:dm:/, "")).filter(Boolean);
+    } catch (err) {
+        console.error("Musteri listesi alinamadi:", err.message);
+        return [];
+    }
+}
+
+// Normal sendDirectReply/sendDirectImage fonksiyonlari hata durumunu disariya
+// dondurmuyor (sessizce logluyor); toplu gonderimde her alici icin gercek
+// basari/hata durumunu raporlayabilmek icin ayri, durum donduren versiyonlar.
+async function sendBroadcastToRecipient(recipientId, message, imageUrl) {
+    const url = `https://graph.instagram.com/v21.0/me/messages`;
+
+    try {
+        await axios.post(
+            url,
+            {
+                recipient: { id: recipientId },
+                message: { text: message },
+            },
+            { params: { access_token: PAGE_ACCESS_TOKEN } }
+        );
+    } catch (err) {
+        const reason = err.response?.data?.error?.message || err.message;
+        return { ok: false, reason };
+    }
+
+    if (imageUrl) {
+        try {
+            await axios.post(
+                url,
+                {
+                    recipient: { id: recipientId },
+                    message: {
+                        attachment: {
+                            type: "image",
+                            payload: { url: imageUrl, is_reusable: true },
+                        },
+                    },
+                },
+                { params: { access_token: PAGE_ACCESS_TOKEN } }
+            );
+        } catch (err) {
+            const reason = err.response?.data?.error?.message || err.message;
+            return { ok: false, reason: `Metin gonderildi, resim basarisiz: ${reason}` };
+        }
+    }
+
+    return { ok: true, reason: null };
+}
+
+async function broadcastToAllCustomers(message, imageUrl) {
+    const recipientIds = await getAllInstagramCustomerIds();
+    const results = [];
+    let sent = 0;
+    let failed = 0;
+
+    for (const recipientId of recipientIds) {
+        const result = await sendBroadcastToRecipient(recipientId, message, imageUrl);
+        if (result.ok) {
+            sent += 1;
+        } else {
+            failed += 1;
+        }
+        results.push({ recipientId, ...result });
+        // Instagram Graph API rate limitine takilmamak icin gonderimler arasi kucuk bekleme.
+        await sleep(300);
+    }
+
+    return { total: recipientIds.length, sent, failed, results };
+}
+
+function checkAdminKey(req, res) {
+    if (!ADMIN_ACCESS_KEY) {
+        res.status(503).send("ADMIN_ACCESS_KEY sunucuda tanimli degil. Once Render'da bu ortam degiskenini olusturun.");
+        return false;
+    }
+    if (req.query.key !== ADMIN_ACCESS_KEY && req.body?.key !== ADMIN_ACCESS_KEY) {
+        res.status(403).send("Yetkisiz erisim: gecersiz veya eksik anahtar.");
+        return false;
+    }
+    return true;
+}
+
+app.get("/broadcast", (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+
+    const key = escapeHtml(req.query.key);
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Toplu Mesaj Gonder - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+    h1 { font-size: 1.4em; }
+    textarea { width: 100%; min-height: 140px; font-size: 1em; padding: 10px; box-sizing: border-box; }
+    input[type=text] { width: 100%; font-size: 1em; padding: 10px; box-sizing: border-box; }
+    label { display: block; margin-top: 16px; font-weight: bold; }
+    button { margin-top: 20px; padding: 12px 24px; font-size: 1em; background: #d32f2f; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    .warn { background: #fff4e5; border: 1px solid #ffb74d; padding: 12px; border-radius: 6px; margin-top: 20px; font-size: 0.92em; }
+    </style>
+    </head>
+    <body>
+    <h1>Instagram - Tum Musterilere Toplu Mesaj</h1>
+    <div class="warn">
+    <strong>Onemli:</strong> Bu mesaj, botla daha once konusmus olan <strong>tum</strong> Instagram musterilerine gonderilmeye calisilacak. Meta'nin kurallari geregi, son 24 saat icinde size yazmamis musterilere gonderim <strong>basarisiz olabilir</strong> — sistem bunu gizlemez, sonuc sayfasinda kime gidip kime gitmedigini gorursunuz. Gonderilen mesajlar geri alinamaz.
+    </div>
+    <form method="POST" action="/broadcast">
+    <input type="hidden" name="key" value="${key}">
+    <label for="message">Mesaj</label>
+    <textarea name="message" id="message" required placeholder="Musterilere gonderilecek mesaji yazin..."></textarea>
+    <label for="imageUrl">Resim URL (opsiyonel)</label>
+    <input type="text" name="imageUrl" id="imageUrl" placeholder="https://... (bos birakilabilir)">
+    <button type="submit">Tum Musterilere Gonder</button>
+    </form>
+    </body>
+    </html>`);
+});
+
+app.post("/broadcast", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+
+    const message = (req.body.message || "").trim();
+    const imageUrl = (req.body.imageUrl || "").trim();
+    const key = escapeHtml(req.query.key || req.body.key);
+
+    if (!message) {
+        res.status(400).send("Mesaj bos olamaz.");
+        return;
+    }
+
+    console.log(`Toplu mesaj baslatildi. Uzunluk: ${message.length}, Resim: ${imageUrl ? "var" : "yok"}`);
+    const summary = await broadcastToAllCustomers(message, imageUrl || null);
+    console.log(`Toplu mesaj tamamlandi. Toplam: ${summary.total}, Basarili: ${summary.sent}, Basarisiz: ${summary.failed}`);
+
+    const rows = summary.results
+        .map(
+            (r) =>
+                `<tr><td>${escapeHtml(r.recipientId)}</td><td>${r.ok ? "Basarili" : "Basarisiz"}</td><td>${escapeHtml(r.reason || "")}</td></tr>`
+        )
+        .join("\n");
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Toplu Mesaj Sonucu - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 0.9em; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
+    a { color: #1565c0; }
+    </style>
+    </head>
+    <body>
+    <h1>Toplu Mesaj Sonucu</h1>
+    <p>Toplam alici: <strong>${summary.total}</strong> — Basarili: <strong>${summary.sent}</strong> — Basarisiz: <strong>${summary.failed}</strong></p>
+    <table>
+    <thead><tr><th>Alici ID</th><th>Durum</th><th>Not</th></tr></thead>
+    <tbody>
+    ${rows || "<tr><td colspan=\"3\">Kayitli musteri bulunamadi.</td></tr>"}
+    </tbody>
+    </table>
+    <p><a href="/broadcast?key=${key}">&larr; Yeni mesaj gonder</a></p>
+    </body>
+    </html>`);
+});
 
 Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {
     app.listen(PORT, () => {

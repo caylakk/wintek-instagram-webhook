@@ -14,6 +14,8 @@ const {
     ANTHROPIC_API_KEY,
     UPSTASH_REDIS_REST_URL,
     UPSTASH_REDIS_REST_TOKEN,
+    TELEGRAM_BOT_TOKEN,
+    RENDER_EXTERNAL_URL,
     PORT = 3000,
 } = process.env;
 
@@ -36,6 +38,9 @@ if (!anthropic) {
 }
 if (!redis) {
     console.warn("Upstash Redis bilgileri eksik - konusma gecmisi saklanmayacak.");
+}
+if (!TELEGRAM_BOT_TOKEN) {
+    console.warn("TELEGRAM_BOT_TOKEN tanimli degil - Telegram entegrasyonu pasif.");
 }
 
 const PRODUCT_FEED_URL = "https://winkelgroup.de/api/products/xml";
@@ -221,6 +226,14 @@ app.post("/webhook", (req, res) => {
          }
 });
 
+app.post("/webhook/telegram", (req, res) => {
+    res.status(200).send("OK");
+
+    handleTelegramMessage(req.body).catch((err) => {
+        console.error("Telegram webhook hatasi:", err.message);
+    });
+});
+
 async function getHistory(historyKey) {
     if (!redis) return [];
     try {
@@ -341,6 +354,42 @@ const finalText = whatsapp
 sendCommentReply(commentId, finalText);
 }
 
+async function handleTelegramMessage(update) {
+    const message = update?.message;
+    const chatId = message?.chat?.id;
+    const text = message?.text;
+
+if (!chatId || !text) return;
+
+console.log(`Telegram mesaji alindi - Chat: ${chatId}, Mesaj: "${text}"`);
+
+const historyKey = `conv:telegram:${chatId}`;
+const existingHistory = await getHistory(historyKey);
+
+if (text.trim() === "/start") {
+    if (existingHistory.length === 0) {
+        await sendTelegramReply(chatId, WELCOME_MESSAGE);
+    }
+    return;
+}
+
+if (existingHistory.length === 0) {
+    await sendTelegramReply(chatId, WELCOME_MESSAGE);
+}
+
+const { text: replyText, whatsapp, productImageUrl } = await generateAIReply(historyKey, text, 400);
+
+if (whatsapp) {
+    await sendTelegramReplyWithWhatsApp(chatId, replyText);
+} else {
+    await sendTelegramReply(chatId, replyText);
+}
+
+if (productImageUrl) {
+    await sendTelegramPhoto(chatId, productImageUrl);
+}
+}
+
 async function sendDirectReply(recipientId, text) {
     const url = `https://graph.instagram.com/v21.0/me/messages`;
 
@@ -454,7 +503,81 @@ try {
 }
 }
 
-refreshProductCatalog().finally(() => {
+async function sendTelegramReply(chatId, text) {
+    if (!TELEGRAM_BOT_TOKEN) return;
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+try {
+    await axios.post(url, {
+        chat_id: chatId,
+        text,
+    });
+    console.log(`Telegram yaniti gonderildi -> ${chatId}`);
+} catch (err) {
+    console.error(
+        `Telegram yaniti gonderilemedi -> ${chatId}:`,
+        err.response?.data || err.message
+        );
+}
+}
+
+async function sendTelegramReplyWithWhatsApp(chatId, text) {
+    if (!TELEGRAM_BOT_TOKEN) return;
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+try {
+    await axios.post(url, {
+        chat_id: chatId,
+        text,
+        reply_markup: {
+            inline_keyboard: [[{ text: "WhatsApp'tan Yaz", url: WHATSAPP_LINK }]],
+        },
+    });
+    console.log(`Telegram yaniti (WhatsApp butonlu) gonderildi -> ${chatId}`);
+} catch (err) {
+    console.error(
+        `Telegram yaniti (WhatsApp butonlu) gonderilemedi -> ${chatId}:`,
+        err.response?.data || err.message
+        );
+    sendTelegramReply(chatId, `${text} WhatsApp: ${WHATSAPP_NUMBER_DISPLAY}`);
+}
+}
+
+async function sendTelegramPhoto(chatId, photoUrl) {
+    if (!TELEGRAM_BOT_TOKEN) return;
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`;
+
+try {
+    await axios.post(url, {
+        chat_id: chatId,
+        photo: photoUrl,
+    });
+    console.log(`Telegram urun fotografi gonderildi -> ${chatId}`);
+} catch (err) {
+    console.error(
+        `Telegram urun fotografi gonderilemedi -> ${chatId}:`,
+        err.response?.data || err.message
+        );
+}
+}
+
+async function setupTelegramWebhook() {
+    if (!TELEGRAM_BOT_TOKEN) return;
+
+const publicUrl = RENDER_EXTERNAL_URL || "https://wintek-instagram-webhook.onrender.com";
+    const webhookUrl = `${publicUrl}/webhook/telegram`;
+
+try {
+    await axios.get(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`, {
+        params: { url: webhookUrl },
+    });
+    console.log(`Telegram webhook ayarlandi -> ${webhookUrl}`);
+} catch (err) {
+    console.error("Telegram webhook ayarlanamadi:", err.response?.data || err.message);
+}
+}
+
+Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {
     app.listen(PORT, () => {
         console.log(`Webhook sunucusu http://localhost:${PORT}/webhook adresinde calisiyor`);
     });

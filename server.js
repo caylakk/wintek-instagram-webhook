@@ -816,20 +816,60 @@ app.post("/broadcast", async (req, res) => {
     </html>`);
 });
 
-async function getConversationSummaries(prefix) {
+// Musteri/lead durumu takibi: her konusmaya (DM veya yorum) elle atanan bir
+// asama etiketi. Redis'te ayri bir key altinda saklanir (lead:<tip>:<id>),
+// konusma gecmisinden bagimsizdir ve TTL'siz kalicidir.
+const LEAD_STATUSES = [
+    { value: "new", label: "Yeni", color: "#1565c0" },
+    { value: "interested", label: "Ilgileniyor", color: "#f9a825" },
+    { value: "converted", label: "Satisa Dondu", color: "#2e7d32" },
+    { value: "cold", label: "Sogudu", color: "#757575" },
+];
+const DEFAULT_LEAD_STATUS = "new";
+
+function leadStatusMeta(value) {
+    return LEAD_STATUSES.find((s) => s.value === value) || LEAD_STATUSES[0];
+}
+
+async function getLeadStatus(type, id) {
+    if (!redis) return DEFAULT_LEAD_STATUS;
+    try {
+        const status = await redis.get(`lead:${type}:${id}`);
+        return typeof status === "string" && status ? status : DEFAULT_LEAD_STATUS;
+    } catch (err) {
+        console.error("Lead durumu alinamadi:", err.message);
+        return DEFAULT_LEAD_STATUS;
+    }
+}
+
+async function setLeadStatus(type, id, status) {
+    if (!redis) return;
+    try {
+        await redis.set(`lead:${type}:${id}`, status);
+    } catch (err) {
+        console.error("Lead durumu kaydedilemedi:", err.message);
+    }
+}
+
+async function getConversationSummaries(type) {
     if (!redis) return [];
+    const prefix = `conv:${type}:`;
     try {
         const keys = await redis.keys(`${prefix}*`);
         const summaries = await Promise.all(
             keys.map(async (key) => {
                 const id = key.slice(prefix.length);
-                const history = await getHistory(key);
+                const [history, leadStatus] = await Promise.all([
+                    getHistory(key),
+                    getLeadStatus(type, id),
+                ]);
                 const last = history[history.length - 1];
                 return {
                     id,
                     messageCount: history.length,
                     lastRole: last?.role || null,
                     lastText: typeof last?.content === "string" ? last.content : "",
+                    leadStatus,
                 };
             })
         );
@@ -843,13 +883,15 @@ async function getConversationSummaries(prefix) {
 
 function renderPanelRows(summaries, type, key) {
     if (summaries.length === 0) {
-        return `<tr><td colspan="4">Henuz kayitli konusma yok.</td></tr>`;
+        return `<tr><td colspan="5">Kayitli konusma yok.</td></tr>`;
     }
     return summaries
         .map((s) => {
             const preview = escapeHtml((s.lastText || "").slice(0, 80)) + (s.lastText && s.lastText.length > 80 ? "..." : "");
+            const meta = leadStatusMeta(s.leadStatus);
             return `<tr>
                 <td>${escapeHtml(s.id)}</td>
+                <td><span class="badge" style="background:${meta.color}">${escapeHtml(meta.label)}</span></td>
                 <td>${s.messageCount}</td>
                 <td>${preview}</td>
                 <td><a href="/panel/${type}/${encodeURIComponent(s.id)}?key=${key}">Goruntule</a></td>
@@ -875,11 +917,23 @@ function renderConversationThread(history) {
 app.get("/panel", async (req, res) => {
     if (!checkAdminKey(req, res)) return;
     const key = escapeHtml(req.query.key);
+    const statusFilter = LEAD_STATUSES.some((s) => s.value === req.query.status) ? req.query.status : null;
 
     const [dmSummaries, commentSummaries] = await Promise.all([
-        getConversationSummaries("conv:dm:"),
-        getConversationSummaries("conv:comment:"),
+        getConversationSummaries("dm"),
+        getConversationSummaries("comment"),
     ]);
+
+    const filteredDm = statusFilter ? dmSummaries.filter((s) => s.leadStatus === statusFilter) : dmSummaries;
+    const filteredComment = statusFilter ? commentSummaries.filter((s) => s.leadStatus === statusFilter) : commentSummaries;
+
+    const filterLinks = [{ label: "Tumu", value: null }, ...LEAD_STATUSES.map((s) => ({ label: s.label, value: s.value }))]
+        .map((f) => {
+            const active = f.value === statusFilter;
+            const href = f.value ? `/panel?key=${key}&status=${f.value}` : `/panel?key=${key}`;
+            return `<a href="${href}" class="filter-link${active ? " active" : ""}">${escapeHtml(f.label)}</a>`;
+        })
+        .join(" ");
 
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(`<!DOCTYPE html>
@@ -897,21 +951,27 @@ app.get("/panel", async (req, res) => {
     a { color: #1565c0; text-decoration: none; }
     a:hover { text-decoration: underline; }
     .nav { margin-top: 24px; font-size: 0.9em; }
+    .badge { display: inline-block; padding: 3px 9px; border-radius: 12px; color: #fff; font-size: 0.8em; white-space: nowrap; }
+    .filters { margin-top: 10px; }
+    .filter-link { display: inline-block; margin-right: 6px; padding: 5px 12px; border-radius: 14px; background: #f1f1f1; color: #333; font-size: 0.85em; }
+    .filter-link:hover { text-decoration: none; background: #e2e2e2; }
+    .filter-link.active { background: #1565c0; color: #fff; }
     </style>
     </head>
     <body>
     <h1>Instagram Musteri Konusmalari</h1>
+    <div class="filters">${filterLinks}</div>
 
     <h2>Direkt Mesajlar (DM)</h2>
     <table>
-    <thead><tr><th>Musteri ID</th><th>Mesaj Sayisi</th><th>Son Mesaj</th><th></th></tr></thead>
-    <tbody>${renderPanelRows(dmSummaries, "dm", key)}</tbody>
+    <thead><tr><th>Musteri ID</th><th>Durum</th><th>Mesaj Sayisi</th><th>Son Mesaj</th><th></th></tr></thead>
+    <tbody>${renderPanelRows(filteredDm, "dm", key)}</tbody>
     </table>
 
     <h2>Gonderi Yorumlari</h2>
     <table>
-    <thead><tr><th>Yorum Yapan ID</th><th>Mesaj Sayisi</th><th>Son Mesaj</th><th></th></tr></thead>
-    <tbody>${renderPanelRows(commentSummaries, "comment", key)}</tbody>
+    <thead><tr><th>Yorum Yapan ID</th><th>Durum</th><th>Mesaj Sayisi</th><th>Son Mesaj</th><th></th></tr></thead>
+    <tbody>${renderPanelRows(filteredComment, "comment", key)}</tbody>
     </table>
 
     <div class="nav"><a href="/broadcast?key=${key}">&larr; Toplu mesaj sayfasina git</a></div>
@@ -928,7 +988,14 @@ app.get("/panel/:type/:id", async (req, res) => {
     }
     const key = escapeHtml(req.query.key);
     const historyKey = `conv:${type}:${id}`;
-    const history = await getHistory(historyKey);
+    const [history, currentStatus] = await Promise.all([
+        getHistory(historyKey),
+        getLeadStatus(type, id),
+    ]);
+
+    const statusOptions = LEAD_STATUSES.map(
+        (s) => `<option value="${s.value}"${s.value === currentStatus ? " selected" : ""}>${escapeHtml(s.label)}</option>`
+    ).join("");
 
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(`<!DOCTYPE html>
@@ -945,14 +1012,40 @@ app.get("/panel/:type/:id", async (req, res) => {
     .msg-bot { background: #e3f2fd; margin-left: auto; text-align: right; }
     .msg-role { font-size: 0.75em; color: #777; margin-bottom: 4px; }
     a { color: #1565c0; }
+    .status-form { margin: 16px 0 24px; padding: 12px 14px; background: #f7f7f7; border-radius: 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .status-form select { padding: 6px 8px; font-size: 0.9em; }
+    .status-form button { padding: 6px 14px; font-size: 0.9em; background: #1565c0; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
     </style>
     </head>
     <body>
     <h1>Konusma: ${escapeHtml(id)}</h1>
     <p><a href="/panel?key=${key}">&larr; Tum konusmalara don</a></p>
+    <form method="POST" action="/panel/${type}/${encodeURIComponent(id)}/status" class="status-form">
+        <input type="hidden" name="key" value="${key}">
+        <label for="status">Musteri Durumu:</label>
+        <select name="status" id="status">${statusOptions}</select>
+        <button type="submit">Guncelle</button>
+    </form>
     ${renderConversationThread(history)}
     </body>
     </html>`);
+});
+
+app.post("/panel/:type/:id/status", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const { type, id } = req.params;
+    if (type !== "dm" && type !== "comment") {
+        res.status(404).send("Gecersiz konusma turu.");
+        return;
+    }
+    const status = req.body.status;
+    if (!LEAD_STATUSES.some((s) => s.value === status)) {
+        res.status(400).send("Gecersiz durum degeri.");
+        return;
+    }
+    await setLeadStatus(type, id, status);
+    const key = escapeHtml(req.query.key || req.body.key);
+    res.redirect(`/panel/${type}/${encodeURIComponent(id)}?key=${key}`);
 });
 
 Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {

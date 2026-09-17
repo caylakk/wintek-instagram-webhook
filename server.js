@@ -127,7 +127,7 @@ const WELCOME_MESSAGE =
 // (button template) kullaniyoruz cunku bunlar - gecici/yan yana duran ve
 // cevaplaninca kaybolan "quick reply" tipinin aksine - mesaj olarak sohbette
 // kalici kalir ve alt alta gorunur. Meta bu sablonda mesaj basina en fazla 3
-// butona izin verdigi icin 4 buton iki ayri mesaja bolunuyor. Musteri birine
+// butona izin verdigi icin 6 buton iki ayri mesaja (3+3) bolunuyor. Musteri birine
 // dokundugunda Instagram bunu bir "postback" olayi olarak gonderir; bu da
 // handleDirectMessage icinde postback.title, sanki musteri o metni yazmis
 // gibi mevcut AI cevap akisina veriliyor.
@@ -138,6 +138,8 @@ const WELCOME_BUTTONS_PRIMARY = [
 ];
 const WELCOME_BUTTONS_SECONDARY = [
     { type: "postback", title: "Ürün Kataloğu", payload: "QR_CATALOG" },
+    { type: "postback", title: "Teknik Destek", payload: "QR_SUPPORT" },
+    { type: "postback", title: "İade/Garanti", payload: "QR_RETURN" },
 ];
 const WELCOME_BUTTONS_SECONDARY_TEXT = "Başka bir konu mu var?";
 
@@ -572,6 +574,36 @@ if (postback?.payload === "QR_DEALER") {
     setLeadStatus("dm", senderId, "interested");
     notifyAdmin(
         `🏢 <b>Bayilik İlgisi - Instagram DM</b>\n` +
+        `Musteri: ${escapeHtml(senderId)}\n\n` +
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+    );
+    return;
+}
+
+// "Teknik Destek" ve "İade/Garanti" butonlari da AI'ya gitmeden dogrudan
+// WhatsApp'a yonlendiriyor: bot bu konularda spesifik bir politika/prosedur
+// bilgisine sahip olmadigi icin yanlis bilgi uretmesindense gercek bir ekip
+// uyesiyle konusturmak daha guvenli.
+if (postback?.payload === "QR_SUPPORT") {
+    await sendDirectReplyWithWhatsApp(
+        senderId,
+        "Teknik destek için ekibimizle doğrudan WhatsApp'tan görüşebilirsiniz, size hemen yardımcı olurlar:"
+    );
+    notifyAdmin(
+        `🛠️ <b>Teknik Destek Talebi - Instagram DM</b>\n` +
+        `Musteri: ${escapeHtml(senderId)}\n\n` +
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+    );
+    return;
+}
+
+if (postback?.payload === "QR_RETURN") {
+    await sendDirectReplyWithWhatsApp(
+        senderId,
+        "İade ve garanti süreçleriyle ilgili ekibimizle WhatsApp'tan görüşebilirsiniz, size en doğru bilgiyi verirler:"
+    );
+    notifyAdmin(
+        `🔄 <b>İade/Garanti Talebi - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n\n` +
         `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
     );

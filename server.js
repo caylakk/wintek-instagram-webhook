@@ -322,6 +322,7 @@ app.post("/bayilik", async (req, res) => {
         mesaj: [sehir, eposta, not].filter(Boolean).join(" / "),
         durum: "Yeni",
     });
+    incrementWeeklyStat("newleads");
 
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(`<!DOCTYPE html>
@@ -520,6 +521,7 @@ try {
         const product = productsWithImages.find((p) => p.barcode === barcode);
         if (product && product.images.length > 0) {
             productImageUrl = product.images[0];
+            trackAskedProduct(product.title);
         }
         cleanText = cleanText.replace(PRODUCT_IMAGE_MARKER_REGEX, "").trim();
     }
@@ -563,6 +565,7 @@ if (await isDuplicateEvent(dedupKey)) {
 console.log(`DM alindi - Gonderen: ${senderId}, Mesaj: "${incomingText}"`);
 
 touchLastCustomerMessage(senderId);
+incrementWeeklyStat("messages");
 
 const historyKey = `conv:dm:${senderId}`;
 const existingHistory = await getHistory(historyKey);
@@ -570,6 +573,7 @@ if (existingHistory.length === 0) {
     await sendDirectReplyWithButtons(senderId, WELCOME_MESSAGE, WELCOME_BUTTONS_PRIMARY);
     await sendDirectReplyWithButtons(senderId, WELCOME_BUTTONS_SECONDARY_TEXT, WELCOME_BUTTONS_SECONDARY);
     syncLeadToSheet({ kanal: "Instagram DM", musteri: senderId, mesaj: incomingText, durum: "Yeni" });
+    incrementWeeklyStat("newleads");
 }
 
 // "Bayilik" hazir cevap butonuna basilirsa AI'ya gitmeden dogrudan iki secenek
@@ -666,6 +670,8 @@ if (await isDuplicateEvent(commentId)) {
 }
 
 console.log(`Yorum alindi - Yazan: ${commenterId}, Yorum: "${commentText}"`);
+
+incrementWeeklyStat("messages");
 
 const { text, whatsapp, needsHuman, handoffReason } = await generateAIReply(`conv:comment:${commenterId}`, commentText, 150);
 
@@ -1464,6 +1470,128 @@ async function runSatisfactionFollowupCheck() {
     }
 }
 
+// Haftalik ozet raporu: her Pazartesi sabahi (Turkiye saatiyle) bir onceki hafta icin
+// toplam mesaj sayisi, yeni lead sayisi ve en cok sorulan urunleri Telegram'dan admin'e
+// gonderir. Boylece panele girmeden genel durum gorulebilir. Sayaclar gun/hafta boyunca
+// handleDirectMessage, handleComment, POST /bayilik ve generateAIReply icindeki urun
+// eslesmesi noktalarinda Redis'e biriktirilir (bkz. asagidaki increment fonksiyonlari),
+// bu fonksiyon sadece haftada bir okuyup rapor halinde gonderir.
+const ISTANBUL_OFFSET_MS = 3 * 60 * 60 * 1000; // Turkiye UTC+3 (sabit, DST yok)
+const WEEKLY_REPORT_CHECK_INTERVAL_MS = 30 * 60 * 1000; // her 30 dakikada bir kontrol edilir
+const WEEKLY_REPORT_SEND_HOUR = 9; // Pazartesi saat 09:00'dan (Turkiye) itibaren gonderilir
+const WEEKLY_STATS_TTL_SECONDS = 60 * 60 * 24 * 35; // 5 hafta - eski istatistikler kendiliginden silinir
+
+function getIstanbulNow() {
+    return new Date(Date.now() + ISTANBUL_OFFSET_MS);
+}
+
+// Verilen (Istanbul saatine kaydirilmis) tarihin icinde bulundugu haftanin Pazartesi
+// gununu "YYYY-MM-DD" olarak dondurur - butun haftalik sayaclar bu anahtar altinda tutulur.
+function getWeekStartKey(istanbulDate) {
+    const day = istanbulDate.getUTCDay(); // 0=Pazar..6=Cumartesi
+    const diffToMonday = (day + 6) % 7;
+    const monday = new Date(istanbulDate);
+    monday.setUTCDate(istanbulDate.getUTCDate() - diffToMonday);
+    return monday.toISOString().slice(0, 10);
+}
+
+async function incrementWeeklyStat(statName) {
+    if (!redis) return;
+    try {
+        const weekKey = getWeekStartKey(getIstanbulNow());
+        const redisKey = `stats:${statName}:${weekKey}`;
+        await redis.incr(redisKey);
+        await redis.expire(redisKey, WEEKLY_STATS_TTL_SECONDS);
+    } catch (err) {
+        console.error(`Haftalik istatistik guncellenemedi (${statName}):`, err.message);
+    }
+}
+
+async function trackAskedProduct(productTitle) {
+    if (!redis || !productTitle) return;
+    try {
+        const weekKey = getWeekStartKey(getIstanbulNow());
+        const redisKey = `stats:products:${weekKey}`;
+        await redis.zincrby(redisKey, 1, productTitle);
+        await redis.expire(redisKey, WEEKLY_STATS_TTL_SECONDS);
+    } catch (err) {
+        console.error("Urun sorusu istatistigi guncellenemedi:", err.message);
+    }
+}
+
+function formatDateTr(isoDate) {
+    const [y, m, d] = isoDate.split("-");
+    return `${d}.${m}.${y}`;
+}
+
+async function buildWeeklyReportMessage(weekKey) {
+    const [messageCount, newLeadCount, topProductsRaw] = await Promise.all([
+        redis.get(`stats:messages:${weekKey}`),
+        redis.get(`stats:newleads:${weekKey}`),
+        redis.zrange(`stats:products:${weekKey}`, 0, 4, { rev: true, withScores: true }),
+    ]);
+
+    const topProducts = [];
+    for (let i = 0; i < topProductsRaw.length; i += 2) {
+        topProducts.push({ title: topProductsRaw[i], count: Number(topProductsRaw[i + 1]) });
+    }
+
+    const weekEndDate = new Date(`${weekKey}T00:00:00.000Z`);
+    weekEndDate.setUTCDate(weekEndDate.getUTCDate() + 6);
+
+    let text =
+        `📊 <b>Haftalık Özet (${formatDateTr(weekKey)} - ${formatDateTr(weekEndDate.toISOString().slice(0, 10))})</b>\n\n` +
+        `💬 Bu hafta gelen mesaj: <b>${Number(messageCount) || 0}</b>\n` +
+        `🆕 Yeni lead: <b>${Number(newLeadCount) || 0}</b>\n\n`;
+
+    if (topProducts.length > 0) {
+        text += `🔥 <b>En çok sorulan ürünler:</b>\n`;
+        topProducts.forEach((p, i) => {
+            text += `${i + 1}. ${escapeHtml(p.title)} (${p.count})\n`;
+        });
+    } else {
+        text += `🔥 En çok sorulan ürünler: bu hafta belirgin bir ürün sorusu olmadı.`;
+    }
+
+    text += `\nPaneli gör: ${PUBLIC_URL}/panel?key=${ADMIN_ACCESS_KEY || ""}`;
+
+    return text.trim();
+}
+
+async function runWeeklyReportCheck({ force = false } = {}) {
+    if (!redis) return;
+    try {
+        const nowIstanbul = getIstanbulNow();
+        if (!force) {
+            const isMonday = nowIstanbul.getUTCDay() === 1;
+            if (!isMonday || nowIstanbul.getUTCHours() < WEEKLY_REPORT_SEND_HOUR) return;
+        }
+
+        const currentWeekKey = getWeekStartKey(nowIstanbul);
+        const lastWeekMonday = new Date(`${currentWeekKey}T00:00:00.000Z`);
+        lastWeekMonday.setUTCDate(lastWeekMonday.getUTCDate() - 7);
+        const lastWeekKey = lastWeekMonday.toISOString().slice(0, 10);
+
+        // Bu hafta (lastWeekKey) icin rapor zaten gonderildiyse tekrar gonderme -
+        // servis Render'in ucretsiz katmaninda uykuya dalip uyanabilir, bu yuzden
+        // "tam saat 09:00'da bir kez" yerine "bu hafta icin gonderilmedi mi" kontrolu yapiyoruz.
+        // force=true iken (manuel test) bu kontrolleri atlayip her zaman gonderir.
+        if (!force) {
+            const alreadySent = await redis.get(`stats:report_sent:${lastWeekKey}`);
+            if (alreadySent) return;
+        }
+
+        const message = await buildWeeklyReportMessage(lastWeekKey);
+        await notifyAdmin(message);
+        if (!force) {
+            await redis.set(`stats:report_sent:${lastWeekKey}`, "1", { ex: WEEKLY_STATS_TTL_SECONDS });
+        }
+        console.log(`Haftalik ozet raporu gonderildi (hafta: ${lastWeekKey}${force ? ", manuel test" : ""})`);
+    } catch (err) {
+        console.error("Haftalik ozet raporu kontrolu hatasi:", err.message);
+    }
+}
+
 async function getConversationSummaries(type) {
     if (!redis) return [];
     const prefix = `conv:${type}:`;
@@ -1677,6 +1805,14 @@ app.get("/admin/run-satisfaction-check", async (req, res) => {
     res.send("Satis sonrasi memnuniyet kontrolu calistirildi. Sonuclar icin sunucu loglarina bakin.");
 });
 
+// Test/manuel calistirma icin: normalde Pazartesi 09:00'da (Turkiye) otomatik calisir,
+// ama beklemeden kontrolu simdi tetiklemek icin bu adres kullanilabilir (force=true).
+app.get("/admin/run-weekly-report", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    await runWeeklyReportCheck({ force: true });
+    res.send("Haftalik ozet raporu (test) calistirildi. Sonuclar icin sunucu loglarina bakin.");
+});
+
 Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {
     app.listen(PORT, () => {
         console.log(`Webhook sunucusu http://localhost:${PORT}/webhook adresinde calisiyor`);
@@ -1686,3 +1822,4 @@ Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {
 setInterval(refreshProductCatalog, PRODUCT_FEED_REFRESH_MS);
 setInterval(runInterestedFollowupCheck, FOLLOWUP_CHECK_INTERVAL_MS);
 setInterval(runSatisfactionFollowupCheck, FOLLOWUP_CHECK_INTERVAL_MS);
+setInterval(runWeeklyReportCheck, WEEKLY_REPORT_CHECK_INTERVAL_MS);

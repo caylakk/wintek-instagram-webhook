@@ -264,6 +264,25 @@ app.post("/webhook/telegram", (req, res) => {
     });
 });
 
+// Render'in ucretsiz plani bir sure hareketsiz kalinca uykuya geciyor; servis
+// "uyanirken" Meta/Telegram hizli yanit alamazsa ayni webhook olayini birkac
+// kez tekrar gonderebiliyor. Bu da ayni musteri mesajinin birden fazla kez
+// islenip birden fazla kez cevaplanmasina yol aciyordu. Asagidaki fonksiyon,
+// her mesaj/postback/yorum/telegram-update icin benzersiz bir kimlikle Redis'e
+// "SET NX" (sadece yoksa yaz) yapar; anahtar zaten varsa bu olay daha once
+// islenmis demektir ve tekrar islenmez.
+const DEDUP_TTL_SECONDS = 60 * 15; // Meta/Telegram'in tekrar deneme penceresinden fazlasiyla uzun
+async function isDuplicateEvent(key) {
+    if (!redis || !key) return false;
+    try {
+        const result = await redis.set(`processed:${key}`, "1", { nx: true, ex: DEDUP_TTL_SECONDS });
+        return result !== "OK"; // "OK" degilse (null) anahtar zaten vardi -> tekrar
+    } catch (err) {
+        console.error("Tekrar mesaj kontrolu hatasi:", err.message);
+        return false; // supheli durumda islemeye devam et, yanlislikla musteriyi atlamayalim
+    }
+}
+
 async function getHistory(historyKey) {
     if (!redis) return [];
     try {
@@ -359,6 +378,15 @@ if (message?.is_echo) return;
 const incomingText = message?.text || postback?.title;
 if (!incomingText) return;
 
+// Ayni webhook olayi (mid) Meta tarafindan tekrar gonderilmis olabilir
+// (orn. servis uykudan uyanirken zamaninda cevap alinamadiginda). Daha
+// once islenmisse burada durup musteriye tekrar cevap gitmesini onleriz.
+const dedupKey = message?.mid || postback?.mid;
+if (await isDuplicateEvent(dedupKey)) {
+    console.log(`Tekrar eden DM/postback atlandi (mid: ${dedupKey})`);
+    return;
+}
+
 console.log(`DM alindi - Gonderen: ${senderId}, Mesaj: "${incomingText}"`);
 
 touchLastCustomerMessage(senderId);
@@ -408,6 +436,11 @@ if (!commenterId || commenterId === IG_BUSINESS_ACCOUNT_ID) return;
 
 if (!commentId || !commentText) return;
 
+if (await isDuplicateEvent(commentId)) {
+    console.log(`Tekrar eden yorum atlandi (id: ${commentId})`);
+    return;
+}
+
 console.log(`Yorum alindi - Yazan: ${commenterId}, Yorum: "${commentText}"`);
 
 const { text, whatsapp, needsHuman, handoffReason } = await generateAIReply(`conv:comment:${commenterId}`, commentText, 150);
@@ -444,6 +477,12 @@ async function handleTelegramMessage(update) {
     const text = message?.text;
 
 if (!chatId || !text) return;
+
+const dedupKey = update?.update_id;
+if (await isDuplicateEvent(dedupKey)) {
+    console.log(`Tekrar eden Telegram guncellemesi atlandi (update_id: ${dedupKey})`);
+    return;
+}
 
 console.log(`Telegram mesaji alindi - Chat: ${chatId}, Mesaj: "${text}"`);
 

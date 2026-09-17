@@ -676,10 +676,19 @@ const finalText = whatsapp
 sendCommentReply(commentId, finalText);
 
 if (whatsapp) {
+    // Fiyat/stok sorusu iceren yorumlarda, yorum cevabinin yanina Meta'nin
+    // "private reply" API'siyle bir kerelik DM de gonderiyoruz. Bu DM, yorum
+    // altina degil dogrudan musterinin gelen kutusuna dusuyor ve donusumu artiriyor.
+    sendPrivateReply(
+        commentId,
+        `Merhaba! 👋 Yorumunuzu gördük, buradan da yardımcı olalım:\n\n${finalText}`
+    );
+
     notifyAdmin(
         `🔔 <b>Stok/Fiyat Sorusu - Instagram Yorum</b>\n` +
         `Yazan: ${escapeHtml(commenterId)}\n` +
-        `Yorum: ${escapeHtml(commentText)}\n\n` +
+        `Yorum: ${escapeHtml(commentText)}\n` +
+        `(Yorum cevabinin yanina ozel DM de gonderildi)\n\n` +
         `Konusmayi gor: ${PUBLIC_URL}/panel/comment/${encodeURIComponent(commenterId)}?key=${ADMIN_ACCESS_KEY || ""}`
     );
 }
@@ -895,6 +904,30 @@ try {
 } catch (err) {
     console.error(
         `Yorum yaniti gonderilemedi -> ${commentId}:`,
+        err.response?.data || err.message
+        );
+}
+}
+
+// Yoruma verilen genel cevabin yanina, Meta'nin izin verdigi "private reply" akisiyla
+// yorum sahibine dogrudan DM gonderir. Bu API sadece yorumdan sonraki 7 gun icinde ve
+// yorum basina bir kez calisir (Meta'nin kendi kisitlamasi) - dedup korumamiz zaten her
+// yorumu bir kez isledigi icin bu sinirla dogal olarak uyumlu.
+async function sendPrivateReply(commentId, text) {
+    const url = `https://graph.instagram.com/v21.0/${commentId}/private_replies`;
+
+try {
+    await axios.post(
+        url,
+        { message: text },
+        {
+            params: { access_token: PAGE_ACCESS_TOKEN },
+        }
+        );
+    console.log(`Yorumdan DM'e ozel yanit gonderildi -> ${commentId}`);
+} catch (err) {
+    console.error(
+        `Yorumdan DM'e ozel yanit gonderilemedi -> ${commentId}:`,
         err.response?.data || err.message
         );
 }

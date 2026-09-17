@@ -26,6 +26,7 @@ const WHATSAPP_NUMBER_DISPLAY = "+90 533 556 62 10";
 const WHATSAPP_NUMBER_DIGITS = "905335566210";
 const WHATSAPP_LINK = `https://wa.me/${WHATSAPP_NUMBER_DIGITS}`;
 const WHATSAPP_BUTTON_MARKER = "[[WHATSAPP_BUTTON]]";
+const HUMAN_HANDOFF_MARKER = "[[HUMAN_HANDOFF]]";
 const PUBLIC_URL = RENDER_EXTERNAL_URL || "https://wintek-instagram-webhook.onrender.com";
 
 const anthropic = ANTHROPIC_API_KEY
@@ -147,7 +148,8 @@ KURALLAR:
 3. Alakasız, uygunsuz ya da Wintek'in işiyle ilgisi olmayan taleplerde kibarca konuyu Wintek'in ürün/hizmetlerine getir ya da gerekiyorsa yukarıdaki WhatsApp yönlendirmesini (2. kuraldaki gibi) kullan.
 4. Yanıtların Instagram DM/yorum ortamına uygun olsun: kısa (1-4 cümle), gereksiz uzatmadan, doğal bir müşteri temsilcisi tonunda. Emoji kullanımı ölçülü olsun, abartma.
 5. Kendini yapay zeka olarak tanıtmana gerek yok, Wintek adına yazan doğal bir temsilci gibi davran.
-6. Konuşmanın başında müşteriye otomatik bir karşılama mesajı zaten gönderiliyor. Bu yüzden sen ayrıca "hoş geldiniz", "merhaba" gibi bir karşılama cümlesiyle başlama; doğrudan müşterinin sorusuna veya talebine odaklan.`;
+6. Konuşmanın başında müşteriye otomatik bir karşılama mesajı zaten gönderiliyor. Bu yüzden sen ayrıca "hoş geldiniz", "merhaba" gibi bir karşılama cümlesiyle başlama; doğrudan müşterinin sorusuna veya talebine odaklan.
+7. Eğer müşteri açıkça gerçek bir yetkili/insanla görüşmek istediğini belirtirse (örneğin: "gerçek biriyle konuşmak istiyorum", "bir yetkiliye bağlar mısınız", "insanla görüşebilir miyim", "müşteri temsilcisi istiyorum" gibi), onu nazikçe yönlendiren kısa bir cevap ver (örn: "Elbette, ekibimizden biri en kısa sürede sizinle ilgilenecek.") ve cevabının en sonuna başka hiçbir şey eklemeden tam olarak şu işareti ekle: ${HUMAN_HANDOFF_MARKER}`;
 
 function buildSystemPrompt() {
     if (productsWithImages.length === 0) {
@@ -163,7 +165,7 @@ function buildSystemPrompt() {
 FOTOĞRAFI MEVCUT ÜRÜNLER (sadece bu listedeki ürünler için fotoğraf paylaşabilirsin):
 ${lines}
 
-7. Müşteri yukarıdaki listede bulunan bir ürünü özellikle soruyorsa ve hangi ürünü kastettiğinden eminsen, cevabının en sonuna (varsa WhatsApp işaretinden sonra, ayrı bir satırda) tam olarak şu formatta ekle: [[PRODUCT_IMAGE:BARKOD]] — BARKOD yerine yukarıdaki listeden ilgili ürünün gerçek barkodunu yaz. Listede olmayan ya da hangi ürün olduğundan emin olmadığın durumlarda bu işareti KESİNLİKLE kullanma; bu durumda elinde o ürünün fotoğrafı olmadığını söyleyip normal şekilde yardımcı ol.`;
+8. Müşteri yukarıdaki listede bulunan bir ürünü özellikle soruyorsa ve hangi ürünü kastettiğinden eminsen, cevabının en sonuna (varsa WhatsApp/insan devri işaretlerinden sonra, ayrı bir satırda) tam olarak şu formatta ekle: [[PRODUCT_IMAGE:BARKOD]] — BARKOD yerine yukarıdaki listeden ilgili ürünün gerçek barkodunu yaz. Listede olmayan ya da hangi ürün olduğundan emin olmadığın durumlarda bu işareti KESİNLİKLE kullanma; bu durumda elinde o ürünün fotoğrafı olmadığını söyleyip normal şekilde yardımcı ol.`;
 
     return `${BASE_SYSTEM_PROMPT}${catalogSection}`;
 }
@@ -276,8 +278,14 @@ async function saveHistory(historyKey, history) {
     }
 }
 
+// needsHuman: bot musteriye anlamli bir cevap uretemedi (API hatasi/bos yanit,
+// handoffReason "hata") ya da musteri acikca gercek biriyle gorusmek istedi
+// (AI, sistem talimatindaki HUMAN_HANDOFF_MARKER'i cevaba ekledi, handoffReason "istek").
+// Cagiran taraf (handleDirectMessage vb.) bu durumda admin'e bildirim gonderir.
 async function generateAIReply(historyKey, userText, maxTokens) {
-    if (!anthropic) return { text: FALLBACK_REPLY, whatsapp: false, productImageUrl: null };
+    if (!anthropic) {
+        return { text: FALLBACK_REPLY, whatsapp: false, productImageUrl: null, needsHuman: true, handoffReason: "hata" };
+    }
 
 const history = await getHistory(historyKey);
     const messages = [...history, { role: "user", content: userText }];
@@ -296,10 +304,15 @@ try {
     .join("\n")
     .trim();
 
-    if (!rawText) return { text: FALLBACK_REPLY, whatsapp: false, productImageUrl: null };
+    if (!rawText) {
+        return { text: FALLBACK_REPLY, whatsapp: false, productImageUrl: null, needsHuman: true, handoffReason: "hata" };
+    }
 
     const whatsapp = rawText.includes(WHATSAPP_BUTTON_MARKER);
     let cleanText = rawText.split(WHATSAPP_BUTTON_MARKER).join("").trim();
+
+    const needsHuman = cleanText.includes(HUMAN_HANDOFF_MARKER);
+    cleanText = cleanText.split(HUMAN_HANDOFF_MARKER).join("").trim();
 
     let productImageUrl = null;
     const productMatch = cleanText.match(PRODUCT_IMAGE_MARKER_REGEX);
@@ -317,10 +330,10 @@ try {
     const updatedHistory = [...messages, { role: "assistant", content: finalText }];
     await saveHistory(historyKey, updatedHistory);
 
-    return { text: finalText, whatsapp, productImageUrl };
+    return { text: finalText, whatsapp, productImageUrl, needsHuman, handoffReason: needsHuman ? "istek" : null };
 } catch (err) {
     console.error("Claude API hatasi:", err.response?.data || err.message);
-    return { text: FALLBACK_REPLY, whatsapp: false, productImageUrl: null };
+    return { text: FALLBACK_REPLY, whatsapp: false, productImageUrl: null, needsHuman: true, handoffReason: "hata" };
 }
 }
 
@@ -344,7 +357,7 @@ if (existingHistory.length === 0) {
     await sendDirectReplyWithQuickReplies(senderId, WELCOME_MESSAGE, WELCOME_QUICK_REPLIES);
 }
 
-const { text, whatsapp, productImageUrl } = await generateAIReply(historyKey, message.text, 400);
+const { text, whatsapp, productImageUrl, needsHuman, handoffReason } = await generateAIReply(historyKey, message.text, 400);
 
 if (whatsapp) {
     await sendDirectReplyWithWhatsApp(senderId, text);
@@ -356,6 +369,16 @@ if (whatsapp) {
     );
 } else {
     await sendDirectReply(senderId, text);
+}
+
+if (needsHuman) {
+    notifyAdmin(
+        `🆘 <b>İnsan Devri Gerekiyor - Instagram DM</b>\n` +
+        `Musteri: ${escapeHtml(senderId)}\n` +
+        `Sebep: ${handoffReason === "istek" ? "Musteri gercek biriyle gorusmek istedi" : "Bot anlamli bir cevap uretemedi (hata/bos yanit)"}\n` +
+        `Mesaj: ${escapeHtml(message.text)}\n\n` +
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+    );
 }
 
 if (productImageUrl) {
@@ -374,7 +397,7 @@ if (!commentId || !commentText) return;
 
 console.log(`Yorum alindi - Yazan: ${commenterId}, Yorum: "${commentText}"`);
 
-const { text, whatsapp } = await generateAIReply(`conv:comment:${commenterId}`, commentText, 150);
+const { text, whatsapp, needsHuman, handoffReason } = await generateAIReply(`conv:comment:${commenterId}`, commentText, 150);
 
 const finalText = whatsapp
     ? `${text} WhatsApp: ${WHATSAPP_NUMBER_DISPLAY}`
@@ -386,6 +409,16 @@ if (whatsapp) {
     notifyAdmin(
         `🔔 <b>Stok/Fiyat Sorusu - Instagram Yorum</b>\n` +
         `Yazan: ${escapeHtml(commenterId)}\n` +
+        `Yorum: ${escapeHtml(commentText)}\n\n` +
+        `Konusmayi gor: ${PUBLIC_URL}/panel/comment/${encodeURIComponent(commenterId)}?key=${ADMIN_ACCESS_KEY || ""}`
+    );
+}
+
+if (needsHuman) {
+    notifyAdmin(
+        `🆘 <b>İnsan Devri Gerekiyor - Instagram Yorum</b>\n` +
+        `Yazan: ${escapeHtml(commenterId)}\n` +
+        `Sebep: ${handoffReason === "istek" ? "Musteri gercek biriyle gorusmek istedi" : "Bot anlamli bir cevap uretemedi (hata/bos yanit)"}\n` +
         `Yorum: ${escapeHtml(commentText)}\n\n` +
         `Konusmayi gor: ${PUBLIC_URL}/panel/comment/${encodeURIComponent(commenterId)}?key=${ADMIN_ACCESS_KEY || ""}`
     );
@@ -415,7 +448,7 @@ if (existingHistory.length === 0) {
     await sendTelegramReply(chatId, WELCOME_MESSAGE);
 }
 
-const { text: replyText, whatsapp, productImageUrl } = await generateAIReply(historyKey, text, 400);
+const { text: replyText, whatsapp, productImageUrl, needsHuman, handoffReason } = await generateAIReply(historyKey, text, 400);
 
 if (whatsapp) {
     await sendTelegramReplyWithWhatsApp(chatId, replyText);
@@ -426,6 +459,15 @@ if (whatsapp) {
     );
 } else {
     await sendTelegramReply(chatId, replyText);
+}
+
+if (needsHuman) {
+    notifyAdmin(
+        `🆘 <b>İnsan Devri Gerekiyor - Telegram</b>\n` +
+        `Musteri: ${escapeHtml(String(chatId))}\n` +
+        `Sebep: ${handoffReason === "istek" ? "Musteri gercek biriyle gorusmek istedi" : "Bot anlamli bir cevap uretemedi (hata/bos yanit)"}\n` +
+        `Mesaj: ${escapeHtml(text)}`
+    );
 }
 
 if (productImageUrl) {

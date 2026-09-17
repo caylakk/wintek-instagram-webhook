@@ -118,6 +118,17 @@ const FALLBACK_REPLY =
 const WELCOME_MESSAGE =
     "Merhaba, Wintek'e hoş geldiniz. İş güvenliği ekipmanları ve endüstriyel el aletlerinin yanı sıra, WINKEL'in yetkili bayisi olarak sanayi, otomotiv ve denizcilik sektörlerine yönelik yapıştırıcı, yağlayıcı, sızdırmazlık ve yüzey bakım ürünleri sunuyoruz. Ürün ve hizmetlerimizle ilgili merak ettiğiniz her konuda size memnuniyetle yardımcı olalım.";
 
+// Ilk mesajla birlikte gonderilen hazir cevap butonlari. Musteri birine
+// dokundugunda Instagram, buton basligini normal DM metni gibi gonderir
+// (message.text = baslik), bu yuzden mevcut AI cevap akisi degistirmeden
+// calisir - sanki musteri o metni yazmis gibi islenir.
+const WELCOME_QUICK_REPLIES = [
+    { content_type: "text", title: "Stok Durumu", payload: "QR_STOCK" },
+    { content_type: "text", title: "Fiyat Teklifi", payload: "QR_PRICE" },
+    { content_type: "text", title: "Bayilik", payload: "QR_DEALER" },
+    { content_type: "text", title: "Ürün Kataloğu", payload: "QR_CATALOG" },
+];
+
 const BASE_SYSTEM_PROMPT = `Sen Wintek'in Instagram hesabı için çalışan bir müşteri asistanısın. Türkçe, samimi, kısa ve net cevaplar veriyorsun.
 
 WINTEK NE SATAR:
@@ -330,7 +341,7 @@ touchLastCustomerMessage(senderId);
 const historyKey = `conv:dm:${senderId}`;
 const existingHistory = await getHistory(historyKey);
 if (existingHistory.length === 0) {
-    await sendDirectReply(senderId, WELCOME_MESSAGE);
+    await sendDirectReplyWithQuickReplies(senderId, WELCOME_MESSAGE, WELCOME_QUICK_REPLIES);
 }
 
 const { text, whatsapp, productImageUrl } = await generateAIReply(historyKey, message.text, 400);
@@ -442,6 +453,31 @@ try {
         `DM yaniti gonderilemedi -> ${recipientId}:`,
         err.response?.data || err.message
         );
+}
+}
+
+async function sendDirectReplyWithQuickReplies(recipientId, text, quickReplies) {
+    const url = `https://graph.instagram.com/v21.0/me/messages`;
+
+try {
+    await axios.post(
+        url,
+        {
+            recipient: { id: recipientId },
+            message: { text, quick_replies: quickReplies },
+        },
+        {
+            params: { access_token: PAGE_ACCESS_TOKEN },
+        }
+        );
+    console.log(`DM yaniti (hazir cevap butonlu) gonderildi -> ${recipientId}`);
+} catch (err) {
+    console.error(
+        `DM yaniti (hazir cevap butonlu) gonderilemedi -> ${recipientId}:`,
+        err.response?.data || err.message
+        );
+    // Butonlu gonderim basarisiz olursa en azindan duz metni gondermeyi dene.
+    sendDirectReply(recipientId, text);
 }
 }
 

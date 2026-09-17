@@ -943,6 +943,15 @@ async function getLeadStatus(type, id) {
 async function setLeadStatus(type, id, status) {
     if (!redis) return;
     try {
+        // Musteri "Satisa Dondu" durumuna ilk kez geciyorsa, satis sonrasi
+        // memnuniyet takibi icin baslangic zamanini kaydet. Zaten "converted"
+        // ise (admin ayni durumu tekrar kaydettiyse) sayaci sifirlama.
+        if (type === "dm" && status === "converted") {
+            const previousStatus = await getLeadStatus(type, id);
+            if (previousStatus !== "converted") {
+                await redis.set(`convertedsince:dm:${id}`, Date.now());
+            }
+        }
         await redis.set(`lead:${type}:${id}`, status);
     } catch (err) {
         console.error("Lead durumu kaydedilemedi:", err.message);
@@ -1035,6 +1044,84 @@ async function runInterestedFollowupCheck() {
         }
     } catch (err) {
         console.error("Ilgileniyor takip kontrolu hatasi:", err.message);
+    }
+}
+
+// Satis sonrasi memnuniyet takibi: bir musteri panelde "Satisa Dondu" olarak
+// isaretlendikten SATISFACTION_DELAY_MS sonra, musterinin cevap verip
+// vermedigine bakilmaksizin tek seferlik bir memnuniyet mesaji gonderilir.
+// "Ilgileniyor" takibinden farki: burada amac "hala ilgileniyor musun" degil
+// "aldigin urunden memnun kaldin mi" sorusu, bu yuzden sessizlik kosulu yok.
+const SATISFACTION_DELAY_MS = 24 * 60 * 60 * 1000; // 1 gun
+const SATISFACTION_LEAD_STATUS = "converted"; // sadece "Satisa Dondu" isaretli musteriler
+const SATISFACTION_MESSAGE =
+    "Merhaba! 👋 Sizinle çalıştığımız için teşekkür ederiz. Ürünlerimizden memnun kaldınız mı? Herhangi bir sorunuz, öneriniz ya da yaşadığınız bir sorun varsa bize buradan yazabilirsiniz, memnuniyetle yardımcı oluruz 🙂\n\nİyi günler dileriz, Wintek Ailesi";
+
+async function getConvertedSince(id) {
+    if (!redis) return null;
+    try {
+        const ts = await redis.get(`convertedsince:dm:${id}`);
+        const n = Number(ts);
+        return Number.isFinite(n) && n > 0 ? n : null;
+    } catch (err) {
+        console.error("Satisa donme zamani alinamadi:", err.message);
+        return null;
+    }
+}
+
+async function getSatisfactionSentFor(id) {
+    if (!redis) return null;
+    try {
+        const ts = await redis.get(`satisfaction:sent:dm:${id}`);
+        const n = Number(ts);
+        return Number.isFinite(n) && n > 0 ? n : null;
+    } catch (err) {
+        console.error("Memnuniyet mesaji kaydi alinamadi:", err.message);
+        return null;
+    }
+}
+
+async function markSatisfactionSent(id, convertedSince) {
+    if (!redis) return;
+    try {
+        await redis.set(`satisfaction:sent:dm:${id}`, convertedSince);
+    } catch (err) {
+        console.error("Memnuniyet mesaji kaydedilemedi:", err.message);
+    }
+}
+
+async function runSatisfactionFollowupCheck() {
+    if (!redis) return;
+    try {
+        const ids = await getAllInstagramCustomerIds(SATISFACTION_LEAD_STATUS);
+        const now = Date.now();
+
+        for (const id of ids) {
+            const convertedSince = await getConvertedSince(id);
+            // Bu ozellik devreye girmeden once "Satisa Dondu" yapilmis musteriler
+            // icin zaman bilgisi yok - yanlislikla gonderim yapmamak icin atlanir.
+            if (!convertedSince) continue;
+            if (now - convertedSince < SATISFACTION_DELAY_MS) continue;
+
+            const alreadySentFor = await getSatisfactionSentFor(id);
+            if (alreadySentFor === convertedSince) continue; // bu donusum icin zaten gonderildi
+
+            const result = await sendBroadcastToRecipient(id, SATISFACTION_MESSAGE, null);
+            if (result.ok) {
+                await markSatisfactionSent(id, convertedSince);
+                console.log(`Satis sonrasi memnuniyet mesaji gonderildi -> ${id}`);
+                notifyAdmin(
+                    `✅ <b>Satış Sonrası Memnuniyet Mesajı Gönderildi</b>\n` +
+                    `Musteri: ${escapeHtml(id)} (Satisa Dondu)\n\n` +
+                    `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(id)}?key=${ADMIN_ACCESS_KEY || ""}`
+                );
+            } else {
+                console.error(`Satis sonrasi memnuniyet mesaji gonderilemedi -> ${id}: ${result.reason}`);
+            }
+            await sleep(300);
+        }
+    } catch (err) {
+        console.error("Memnuniyet takip kontrolu hatasi:", err.message);
     }
 }
 
@@ -1243,6 +1330,14 @@ app.get("/admin/run-followup-check", async (req, res) => {
     res.send("Ilgileniyor takip mesaji kontrolu calistirildi. Sonuclar icin sunucu loglarina bakin.");
 });
 
+// Test/manuel calistirma icin: normalde her 30 dakikada bir otomatik calisir,
+// ama 1 gun beklemeden kontrolu simdi tetiklemek icin bu adres kullanilabilir.
+app.get("/admin/run-satisfaction-check", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    await runSatisfactionFollowupCheck();
+    res.send("Satis sonrasi memnuniyet kontrolu calistirildi. Sonuclar icin sunucu loglarina bakin.");
+});
+
 Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {
     app.listen(PORT, () => {
         console.log(`Webhook sunucusu http://localhost:${PORT}/webhook adresinde calisiyor`);
@@ -1251,3 +1346,4 @@ Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {
 
 setInterval(refreshProductCatalog, PRODUCT_FEED_REFRESH_MS);
 setInterval(runInterestedFollowupCheck, FOLLOWUP_CHECK_INTERVAL_MS);
+setInterval(runSatisfactionFollowupCheck, FOLLOWUP_CHECK_INTERVAL_MS);

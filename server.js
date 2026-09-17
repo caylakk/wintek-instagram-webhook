@@ -119,16 +119,23 @@ const FALLBACK_REPLY =
 const WELCOME_MESSAGE =
     "Merhaba, Wintek'e hoş geldiniz. İş güvenliği ekipmanları ve endüstriyel el aletlerinin yanı sıra, WINKEL'in yetkili bayisi olarak sanayi, otomotiv ve denizcilik sektörlerine yönelik yapıştırıcı, yağlayıcı, sızdırmazlık ve yüzey bakım ürünleri sunuyoruz. Ürün ve hizmetlerimizle ilgili merak ettiğiniz her konuda size memnuniyetle yardımcı olalım.";
 
-// Ilk mesajla birlikte gonderilen hazir cevap butonlari. Musteri birine
-// dokundugunda Instagram, buton basligini normal DM metni gibi gonderir
-// (message.text = baslik), bu yuzden mevcut AI cevap akisi degistirmeden
-// calisir - sanki musteri o metni yazmis gibi islenir.
-const WELCOME_QUICK_REPLIES = [
-    { content_type: "text", title: "Stok Durumu", payload: "QR_STOCK" },
-    { content_type: "text", title: "Fiyat Teklifi", payload: "QR_PRICE" },
-    { content_type: "text", title: "Bayilik", payload: "QR_DEALER" },
-    { content_type: "text", title: "Ürün Kataloğu", payload: "QR_CATALOG" },
+// Ilk mesajla birlikte gonderilen hazir cevap butonlari. "Buton sablonu"
+// (button template) kullaniyoruz cunku bunlar - gecici/yan yana duran ve
+// cevaplaninca kaybolan "quick reply" tipinin aksine - mesaj olarak sohbette
+// kalici kalir ve alt alta gorunur. Meta bu sablonda mesaj basina en fazla 3
+// butona izin verdigi icin 4 buton iki ayri mesaja bolunuyor. Musteri birine
+// dokundugunda Instagram bunu bir "postback" olayi olarak gonderir; bu da
+// handleDirectMessage icinde postback.title, sanki musteri o metni yazmis
+// gibi mevcut AI cevap akisina veriliyor.
+const WELCOME_BUTTONS_PRIMARY = [
+    { type: "postback", title: "Stok Durumu", payload: "QR_STOCK" },
+    { type: "postback", title: "Fiyat Teklifi", payload: "QR_PRICE" },
+    { type: "postback", title: "Bayilik", payload: "QR_DEALER" },
 ];
+const WELCOME_BUTTONS_SECONDARY = [
+    { type: "postback", title: "Ürün Kataloğu", payload: "QR_CATALOG" },
+];
+const WELCOME_BUTTONS_SECONDARY_TEXT = "Başka bir konu mu var?";
 
 const BASE_SYSTEM_PROMPT = `Sen Wintek'in Instagram hesabı için çalışan bir müşteri asistanısın. Türkçe, samimi, kısa ve net cevaplar veriyorsun.
 
@@ -340,31 +347,37 @@ try {
 async function handleDirectMessage(event) {
     const senderId = event.sender?.id;
     const message = event.message;
+    const postback = event.postback;
 
 if (!senderId || senderId === IG_BUSINESS_ACCOUNT_ID) return;
 
 if (message?.is_echo) return;
 
-if (!message?.text) return;
+// Kalici buton sablonundaki bir butona dokunuldugunda Instagram bunu
+// event.message degil event.postback olarak gonderir. Ikisini de ayni
+// akista, sanki musteri postback.title'i yazmis gibi isliyoruz.
+const incomingText = message?.text || postback?.title;
+if (!incomingText) return;
 
-console.log(`DM alindi - Gonderen: ${senderId}, Mesaj: "${message.text}"`);
+console.log(`DM alindi - Gonderen: ${senderId}, Mesaj: "${incomingText}"`);
 
 touchLastCustomerMessage(senderId);
 
 const historyKey = `conv:dm:${senderId}`;
 const existingHistory = await getHistory(historyKey);
 if (existingHistory.length === 0) {
-    await sendDirectReplyWithQuickReplies(senderId, WELCOME_MESSAGE, WELCOME_QUICK_REPLIES);
+    await sendDirectReplyWithButtons(senderId, WELCOME_MESSAGE, WELCOME_BUTTONS_PRIMARY);
+    await sendDirectReplyWithButtons(senderId, WELCOME_BUTTONS_SECONDARY_TEXT, WELCOME_BUTTONS_SECONDARY);
 }
 
-const { text, whatsapp, productImageUrl, needsHuman, handoffReason } = await generateAIReply(historyKey, message.text, 400);
+const { text, whatsapp, productImageUrl, needsHuman, handoffReason } = await generateAIReply(historyKey, incomingText, 400);
 
 if (whatsapp) {
     await sendDirectReplyWithWhatsApp(senderId, text);
     notifyAdmin(
         `🔔 <b>Stok/Fiyat Sorusu - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n` +
-        `Mesaj: ${escapeHtml(message.text)}\n\n` +
+        `Mesaj: ${escapeHtml(incomingText)}\n\n` +
         `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
     );
 } else {
@@ -376,7 +389,7 @@ if (needsHuman) {
         `🆘 <b>İnsan Devri Gerekiyor - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n` +
         `Sebep: ${handoffReason === "istek" ? "Musteri gercek biriyle gorusmek istedi" : "Bot anlamli bir cevap uretemedi (hata/bos yanit)"}\n` +
-        `Mesaj: ${escapeHtml(message.text)}\n\n` +
+        `Mesaj: ${escapeHtml(incomingText)}\n\n` +
         `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
     );
 }
@@ -498,7 +511,9 @@ try {
 }
 }
 
-async function sendDirectReplyWithQuickReplies(recipientId, text, quickReplies) {
+// Kalici, sohbette alt alta duran buton sablonu (button template) gonderir.
+// Meta bu sablonda mesaj basina en fazla 3 buton izin veriyor.
+async function sendDirectReplyWithButtons(recipientId, text, buttons) {
     const url = `https://graph.instagram.com/v21.0/me/messages`;
 
 try {
@@ -506,7 +521,16 @@ try {
         url,
         {
             recipient: { id: recipientId },
-            message: { text, quick_replies: quickReplies },
+            message: {
+                attachment: {
+                    type: "template",
+                    payload: {
+                        template_type: "button",
+                        text: text.slice(0, 640),
+                        buttons,
+                    },
+                },
+            },
         },
         {
             params: { access_token: PAGE_ACCESS_TOKEN },

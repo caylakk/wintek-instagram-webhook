@@ -325,6 +325,8 @@ if (!message?.text) return;
 
 console.log(`DM alindi - Gonderen: ${senderId}, Mesaj: "${message.text}"`);
 
+touchLastCustomerMessage(senderId);
+
 const historyKey = `conv:dm:${senderId}`;
 const existingHistory = await getHistory(historyKey);
 if (existingHistory.length === 0) {
@@ -869,6 +871,95 @@ async function setLeadStatus(type, id, status) {
     }
 }
 
+// "Ilgileniyor" durumundaki musteriler belirli bir sure (FOLLOWUP_DELAY_MS)
+// boyunca tekrar yazmazsa, tek seferlik otomatik bir hatirlatma mesaji gonderilir.
+// Musterinin son mesaj zamani lastmsg:dm:<id> anahtarinda tutulur (handleDirectMessage
+// her gercek musteri mesajinda gunceller); gonderim yapildiginda o anki son mesaj
+// zamani followup:sent:dm:<id> anahtarina yazilir, boylece musteri tekrar yazip
+// yeniden sessiz kalmadikca ayni donem icin ikinci kez gonderilmez.
+const FOLLOWUP_DELAY_MS = 24 * 60 * 60 * 1000; // 24 saat
+const FOLLOWUP_CHECK_INTERVAL_MS = 30 * 60 * 1000; // her 30 dakikada bir kontrol edilir
+const FOLLOWUP_LEAD_STATUS = "interested"; // sadece "Ilgileniyor" isaretli musteriler
+const FOLLOWUP_MESSAGE =
+    "Merhaba! 👋 Bir süre önce bizimle iletişime geçmiştiniz, size nasıl yardımcı olabileceğimizi merak ettik. Aklınızda kalan bir soru ya da ihtiyacınız varsa buradayız, yazmanız yeterli 🙂\n\nİyi günler dileriz!";
+
+async function touchLastCustomerMessage(id) {
+    if (!redis) return;
+    try {
+        await redis.set(`lastmsg:dm:${id}`, Date.now(), { ex: HISTORY_TTL_SECONDS });
+    } catch (err) {
+        console.error("Son musteri mesaj zamani kaydedilemedi:", err.message);
+    }
+}
+
+async function getLastCustomerMessageTime(id) {
+    if (!redis) return null;
+    try {
+        const ts = await redis.get(`lastmsg:dm:${id}`);
+        const n = Number(ts);
+        return Number.isFinite(n) && n > 0 ? n : null;
+    } catch (err) {
+        console.error("Son musteri mesaj zamani alinamadi:", err.message);
+        return null;
+    }
+}
+
+async function getFollowupSentFor(id) {
+    if (!redis) return null;
+    try {
+        const ts = await redis.get(`followup:sent:dm:${id}`);
+        const n = Number(ts);
+        return Number.isFinite(n) && n > 0 ? n : null;
+    } catch (err) {
+        console.error("Takip mesaji kaydi alinamadi:", err.message);
+        return null;
+    }
+}
+
+async function markFollowupSent(id, lastCustomerMsgTime) {
+    if (!redis) return;
+    try {
+        await redis.set(`followup:sent:dm:${id}`, lastCustomerMsgTime, { ex: HISTORY_TTL_SECONDS });
+    } catch (err) {
+        console.error("Takip mesaji kaydedilemedi:", err.message);
+    }
+}
+
+async function runInterestedFollowupCheck() {
+    if (!redis) return;
+    try {
+        const ids = await getAllInstagramCustomerIds(FOLLOWUP_LEAD_STATUS);
+        const now = Date.now();
+
+        for (const id of ids) {
+            const lastMsgTime = await getLastCustomerMessageTime(id);
+            // Bu ozellik devreye girmeden once yazmis musteriler icin zaman bilgisi
+            // yok - yanlislikla gonderim yapmamak icin bunlar atlanir.
+            if (!lastMsgTime) continue;
+            if (now - lastMsgTime < FOLLOWUP_DELAY_MS) continue;
+
+            const alreadySentFor = await getFollowupSentFor(id);
+            if (alreadySentFor === lastMsgTime) continue; // bu sessizlik donemi icin zaten gonderildi
+
+            const result = await sendBroadcastToRecipient(id, FOLLOWUP_MESSAGE, null);
+            if (result.ok) {
+                await markFollowupSent(id, lastMsgTime);
+                console.log(`Ilgileniyor takip mesaji gonderildi -> ${id}`);
+                notifyAdmin(
+                    `📨 <b>Otomatik Takip Mesaji Gonderildi</b>\n` +
+                    `Musteri: ${escapeHtml(id)} (Ilgileniyor, 24 saat cevapsiz)\n\n` +
+                    `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(id)}?key=${ADMIN_ACCESS_KEY || ""}`
+                );
+            } else {
+                console.error(`Ilgileniyor takip mesaji gonderilemedi -> ${id}: ${result.reason}`);
+            }
+            await sleep(300);
+        }
+    } catch (err) {
+        console.error("Ilgileniyor takip kontrolu hatasi:", err.message);
+    }
+}
+
 async function getConversationSummaries(type) {
     if (!redis) return [];
     const prefix = `conv:${type}:`;
@@ -1066,6 +1157,14 @@ app.post("/panel/:type/:id/status", async (req, res) => {
     res.redirect(`/panel/${type}/${encodeURIComponent(id)}?key=${key}`);
 });
 
+// Test/manuel calistirma icin: normalde her 30 dakikada bir otomatik calisir,
+// ama 24 saat beklemeden kontrolu simdi tetiklemek icin bu adres kullanilabilir.
+app.get("/admin/run-followup-check", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    await runInterestedFollowupCheck();
+    res.send("Ilgileniyor takip mesaji kontrolu calistirildi. Sonuclar icin sunucu loglarina bakin.");
+});
+
 Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {
     app.listen(PORT, () => {
         console.log(`Webhook sunucusu http://localhost:${PORT}/webhook adresinde calisiyor`);
@@ -1073,3 +1172,4 @@ Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {
 });
 
 setInterval(refreshProductCatalog, PRODUCT_FEED_REFRESH_MS);
+setInterval(runInterestedFollowupCheck, FOLLOWUP_CHECK_INTERVAL_MS);

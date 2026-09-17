@@ -28,6 +28,9 @@ const WHATSAPP_LINK = `https://wa.me/${WHATSAPP_NUMBER_DIGITS}`;
 const WHATSAPP_BUTTON_MARKER = "[[WHATSAPP_BUTTON]]";
 const HUMAN_HANDOFF_MARKER = "[[HUMAN_HANDOFF]]";
 const PUBLIC_URL = RENDER_EXTERNAL_URL || "https://wintek-instagram-webhook.onrender.com";
+const BAYILIK_FORM_URL = `${PUBLIC_URL}/bayilik`;
+const BAYILIK_APPLICATIONS_KEY = "bayilik:basvurular";
+const BAYILIK_APPLICATIONS_MAX = 500; // listenin sinirsiz buyumesini onlemek icin
 
 const anthropic = ANTHROPIC_API_KEY
 ? new Anthropic({ apiKey: ANTHROPIC_API_KEY })
@@ -229,6 +232,161 @@ app.get("/privacy", (req, res) => {
     </html>`);
 });
 
+app.get("/bayilik", (req, res) => {
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Bayilik Basvuru Formu - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+    h1 { font-size: 1.4em; margin-bottom: 4px; }
+    p.intro { color: #555; margin-top: 0; }
+    label { display: block; margin-top: 16px; font-weight: bold; }
+    input[type=text], input[type=tel], input[type=email] { width: 100%; font-size: 1em; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
+    textarea { width: 100%; min-height: 100px; font-size: 1em; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
+    button { margin-top: 22px; padding: 12px 24px; font-size: 1em; background: #d32f2f; color: #fff; border: none; border-radius: 6px; cursor: pointer; width: 100%; }
+    button:hover { background: #b71c1c; }
+    .req { color: #d32f2f; }
+    </style>
+    </head>
+    <body>
+    <h1>Bayilik Başvuru Formu</h1>
+    <p class="intro">Wintek / WINKEL bayilik başvurunuz için aşağıdaki bilgileri doldurun, ekibimiz en kısa sürede sizinle iletişime geçsin.</p>
+    <form method="POST" action="/bayilik">
+    <label for="adSoyad">Ad Soyad <span class="req">*</span></label>
+    <input type="text" name="adSoyad" id="adSoyad" required>
+    <label for="firma">Firma / İşletme Adı <span class="req">*</span></label>
+    <input type="text" name="firma" id="firma" required>
+    <label for="telefon">Telefon <span class="req">*</span></label>
+    <input type="tel" name="telefon" id="telefon" required>
+    <label for="sehir">Şehir</label>
+    <input type="text" name="sehir" id="sehir">
+    <label for="eposta">E-posta</label>
+    <input type="email" name="eposta" id="eposta">
+    <label for="not">Not / Mesaj</label>
+    <textarea name="not" id="not" placeholder="Ilgilendiginiz urunler, mevcut is alaniniz vb. (opsiyonel)"></textarea>
+    <button type="submit">Başvuruyu Gönder</button>
+    </form>
+    </body>
+    </html>`);
+});
+
+app.post("/bayilik", async (req, res) => {
+    const adSoyad = (req.body.adSoyad || "").trim();
+    const firma = (req.body.firma || "").trim();
+    const telefon = (req.body.telefon || "").trim();
+    const sehir = (req.body.sehir || "").trim();
+    const eposta = (req.body.eposta || "").trim();
+    const not = (req.body.not || "").trim();
+
+    if (!adSoyad || !firma || !telefon) {
+        res.status(400).send("Ad Soyad, Firma ve Telefon alanlari zorunludur. Lutfen geri donup formu eksiksiz doldurun.");
+        return;
+    }
+
+    const application = { adSoyad, firma, telefon, sehir, eposta, not, timestamp: Date.now() };
+
+    if (redis) {
+        try {
+            await redis.lpush(BAYILIK_APPLICATIONS_KEY, JSON.stringify(application));
+            await redis.ltrim(BAYILIK_APPLICATIONS_KEY, 0, BAYILIK_APPLICATIONS_MAX - 1);
+        } catch (err) {
+            console.error("Bayilik basvurusu Redis'e kaydedilemedi:", err.message);
+        }
+    }
+
+    notifyAdmin(
+        `🏢 <b>Yeni Bayilik Başvurusu</b>\n` +
+        `Ad Soyad: ${escapeHtml(adSoyad)}\n` +
+        `Firma: ${escapeHtml(firma)}\n` +
+        `Telefon: ${escapeHtml(telefon)}\n` +
+        (sehir ? `Şehir: ${escapeHtml(sehir)}\n` : "") +
+        (eposta ? `E-posta: ${escapeHtml(eposta)}\n` : "") +
+        (not ? `Not: ${escapeHtml(not)}\n` : "")
+    );
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Basvurunuz Alindi - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 480px; margin: 80px auto; padding: 0 20px; line-height: 1.6; color: #222; text-align: center; }
+    h1 { font-size: 1.4em; }
+    </style>
+    </head>
+    <body>
+    <h1>✅ Başvurunuz alındı</h1>
+    <p>Teşekkürler ${escapeHtml(adSoyad)}, bayilik başvurunuz bize ulaştı. Ekibimiz en kısa sürede sizinle iletişime geçecek.</p>
+    </body>
+    </html>`);
+});
+
+app.get("/admin/bayilik-basvurulari", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+
+    let applications = [];
+    if (redis) {
+        try {
+            const raw = await redis.lrange(BAYILIK_APPLICATIONS_KEY, 0, -1);
+            applications = raw
+                .map((item) => {
+                    try {
+                        return typeof item === "string" ? JSON.parse(item) : item;
+                    } catch {
+                        return null;
+                    }
+                })
+                .filter(Boolean);
+        } catch (err) {
+            console.error("Bayilik basvurulari okunamadi:", err.message);
+        }
+    }
+
+    const rows = applications
+        .map(
+            (a) => `<tr>
+            <td>${new Date(a.timestamp).toLocaleString("tr-TR")}</td>
+            <td>${escapeHtml(a.adSoyad)}</td>
+            <td>${escapeHtml(a.firma)}</td>
+            <td>${escapeHtml(a.telefon)}</td>
+            <td>${escapeHtml(a.sehir || "-")}</td>
+            <td>${escapeHtml(a.eposta || "-")}</td>
+            <td>${escapeHtml(a.not || "-")}</td>
+            </tr>`
+        )
+        .join("");
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Bayilik Basvurulari - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 1000px; margin: 40px auto; padding: 0 20px; line-height: 1.5; color: #222; }
+    h1 { font-size: 1.4em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 0.92em; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; vertical-align: top; }
+    th { background: #f5f5f5; }
+    </style>
+    </head>
+    <body>
+    <h1>Bayilik Başvuruları (${applications.length})</h1>
+    <table>
+    <tr><th>Tarih</th><th>Ad Soyad</th><th>Firma</th><th>Telefon</th><th>Şehir</th><th>E-posta</th><th>Not</th></tr>
+    ${rows || `<tr><td colspan="7">Henuz basvuru yok.</td></tr>`}
+    </table>
+    </body>
+    </html>`);
+});
+
 app.post("/webhook", (req, res) => {
     res.status(200).send("EVENT_RECEIVED");
 
@@ -396,6 +554,26 @@ const existingHistory = await getHistory(historyKey);
 if (existingHistory.length === 0) {
     await sendDirectReplyWithButtons(senderId, WELCOME_MESSAGE, WELCOME_BUTTONS_PRIMARY);
     await sendDirectReplyWithButtons(senderId, WELCOME_BUTTONS_SECONDARY_TEXT, WELCOME_BUTTONS_SECONDARY);
+}
+
+// "Bayilik" hazir cevap butonuna basilirsa AI'ya gitmeden dogrudan iki secenek
+// sunuyoruz: kisa bir online basvuru formu ya da WhatsApp'tan direkt yazisma.
+if (postback?.payload === "QR_DEALER") {
+    await sendDirectReplyWithButtons(
+        senderId,
+        "Bayilik başvurunuzu hemen online formdan iletebilir ya da doğrudan WhatsApp'tan ekibimizle görüşebilirsiniz:",
+        [
+            { type: "web_url", url: BAYILIK_FORM_URL, title: "Başvuru Formu" },
+            { type: "web_url", url: WHATSAPP_LINK, title: "WhatsApp'tan Yaz" },
+        ]
+    );
+    setLeadStatus("dm", senderId, "interested");
+    notifyAdmin(
+        `🏢 <b>Bayilik İlgisi - Instagram DM</b>\n` +
+        `Musteri: ${escapeHtml(senderId)}\n\n` +
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+    );
+    return;
 }
 
 const { text, whatsapp, productImageUrl, needsHuman, handoffReason } = await generateAIReply(historyKey, incomingText, 400);

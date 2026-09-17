@@ -19,6 +19,7 @@ const {
     RENDER_EXTERNAL_URL,
     ADMIN_ACCESS_KEY,
     ADMIN_TELEGRAM_CHAT_ID,
+    GOOGLE_SHEETS_WEBHOOK_URL,
     PORT = 3000,
 } = process.env;
 
@@ -56,6 +57,9 @@ if (!ADMIN_ACCESS_KEY) {
 }
 if (!TELEGRAM_BOT_TOKEN || !ADMIN_TELEGRAM_CHAT_ID) {
     console.warn("TELEGRAM_BOT_TOKEN ve/veya ADMIN_TELEGRAM_CHAT_ID tanimli degil - admin bildirimleri pasif.");
+}
+if (!GOOGLE_SHEETS_WEBHOOK_URL) {
+    console.warn("GOOGLE_SHEETS_WEBHOOK_URL tanimli degil - Google Sheets lead aktarimi pasif.");
 }
 
 const PRODUCT_FEED_URL = "https://winkelgroup.de/api/products/xml";
@@ -312,6 +316,13 @@ app.post("/bayilik", async (req, res) => {
         (not ? `Not: ${escapeHtml(not)}\n` : "")
     );
 
+    syncLeadToSheet({
+        kanal: "Bayilik Formu",
+        musteri: `${adSoyad} - ${firma} (${telefon})`,
+        mesaj: [sehir, eposta, not].filter(Boolean).join(" / "),
+        durum: "Yeni",
+    });
+
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(`<!DOCTYPE html>
     <html lang="tr">
@@ -558,6 +569,7 @@ const existingHistory = await getHistory(historyKey);
 if (existingHistory.length === 0) {
     await sendDirectReplyWithButtons(senderId, WELCOME_MESSAGE, WELCOME_BUTTONS_PRIMARY);
     await sendDirectReplyWithButtons(senderId, WELCOME_BUTTONS_SECONDARY_TEXT, WELCOME_BUTTONS_SECONDARY);
+    syncLeadToSheet({ kanal: "Instagram DM", musteri: senderId, mesaj: incomingText, durum: "Yeni" });
 }
 
 // "Bayilik" hazir cevap butonuna basilirsa AI'ya gitmeden dogrudan iki secenek
@@ -977,6 +989,25 @@ try {
 } catch (err) {
     console.error("Admin bildirimi gonderilemedi:", err.response?.data || err.message);
 }
+}
+
+// Yeni bir lead (ilk kez yazan DM musterisi veya Bayilik basvurusu) olustugunda
+// Nedim'in kendi kurdugu Google Apps Script webhook'una satir eklemesi icin
+// gonderiyoruz. Boylece Instagram panelinin disinda, kendi Google E-Tablosunda
+// da tum lead'leri takip edebiliyor. Webhook tanimli degilse sessizce atlanir.
+async function syncLeadToSheet({ kanal, musteri, mesaj, durum }) {
+    if (!GOOGLE_SHEETS_WEBHOOK_URL) return;
+    try {
+        await axios.post(GOOGLE_SHEETS_WEBHOOK_URL, {
+            tarih: new Date().toISOString(),
+            kanal: kanal || "",
+            musteri: musteri || "",
+            mesaj: mesaj || "",
+            durum: durum || "Yeni",
+        });
+    } catch (err) {
+        console.error("Google Sheets'e lead aktarilamadi:", err.response?.data || err.message);
+    }
 }
 
 function escapeHtml(str) {

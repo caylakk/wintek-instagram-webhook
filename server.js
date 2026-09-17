@@ -637,11 +637,16 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function getAllInstagramCustomerIds() {
+async function getAllInstagramCustomerIds(statusFilter) {
     if (!redis) return [];
     try {
         const keys = await redis.keys("conv:dm:*");
-        return keys.map((k) => k.replace(/^conv:dm:/, "")).filter(Boolean);
+        let ids = keys.map((k) => k.replace(/^conv:dm:/, "")).filter(Boolean);
+        if (statusFilter) {
+            const statuses = await Promise.all(ids.map((id) => getLeadStatus("dm", id)));
+            ids = ids.filter((_, i) => statuses[i] === statusFilter);
+        }
+        return ids;
     } catch (err) {
         console.error("Musteri listesi alinamadi:", err.message);
         return [];
@@ -692,8 +697,8 @@ async function sendBroadcastToRecipient(recipientId, message, imageUrl) {
     return { ok: true, reason: null };
 }
 
-async function broadcastToAllCustomers(message, imageUrl) {
-    const recipientIds = await getAllInstagramCustomerIds();
+async function broadcastToAllCustomers(message, imageUrl, statusFilter) {
+    const recipientIds = await getAllInstagramCustomerIds(statusFilter);
     const results = [];
     let sent = 0;
     let failed = 0;
@@ -729,6 +734,9 @@ app.get("/broadcast", (req, res) => {
     if (!checkAdminKey(req, res)) return;
 
     const key = escapeHtml(req.query.key);
+    const statusOptions = LEAD_STATUSES.map(
+        (s) => `<option value="${s.value}">${escapeHtml(s.label)}</option>`
+    ).join("");
 
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(`<!DOCTYPE html>
@@ -742,23 +750,29 @@ app.get("/broadcast", (req, res) => {
     h1 { font-size: 1.4em; }
     textarea { width: 100%; min-height: 140px; font-size: 1em; padding: 10px; box-sizing: border-box; }
     input[type=text] { width: 100%; font-size: 1em; padding: 10px; box-sizing: border-box; }
+    select { width: 100%; font-size: 1em; padding: 10px; box-sizing: border-box; }
     label { display: block; margin-top: 16px; font-weight: bold; }
     button { margin-top: 20px; padding: 12px 24px; font-size: 1em; background: #d32f2f; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
     .warn { background: #fff4e5; border: 1px solid #ffb74d; padding: 12px; border-radius: 6px; margin-top: 20px; font-size: 0.92em; }
     </style>
     </head>
     <body>
-    <h1>Instagram - Tum Musterilere Toplu Mesaj</h1>
+    <h1>Instagram - Toplu Mesaj</h1>
     <div class="warn">
-    <strong>Onemli:</strong> Bu mesaj, botla daha once konusmus olan <strong>tum</strong> Instagram musterilerine gonderilmeye calisilacak. Meta'nin kurallari geregi, son 24 saat icinde size yazmamis musterilere gonderim <strong>basarisiz olabilir</strong> — sistem bunu gizlemez, sonuc sayfasinda kime gidip kime gitmedigini gorursunuz. Gonderilen mesajlar geri alinamaz.
+    <strong>Onemli:</strong> Bu mesaj, botla daha once konusmus olan ve asagida sectigin durumdaki Instagram musterilerine gonderilmeye calisilacak. Meta'nin kurallari geregi, son 24 saat icinde size yazmamis musterilere gonderim <strong>basarisiz olabilir</strong> — sistem bunu gizlemez, sonuc sayfasinda kime gidip kime gitmedigini gorursunuz. Gonderilen mesajlar geri alinamaz.
     </div>
     <form method="POST" action="/broadcast">
     <input type="hidden" name="key" value="${key}">
+    <label for="statusFilter">Kime Gonderilsin</label>
+    <select name="statusFilter" id="statusFilter">
+    <option value="">Tum musteriler (durumdan bagimsiz)</option>
+    ${statusOptions}
+    </select>
     <label for="message">Mesaj</label>
     <textarea name="message" id="message" required placeholder="Musterilere gonderilecek mesaji yazin..."></textarea>
     <label for="imageUrl">Resim URL (opsiyonel)</label>
     <input type="text" name="imageUrl" id="imageUrl" placeholder="https://... (bos birakilabilir)">
-    <button type="submit">Tum Musterilere Gonder</button>
+    <button type="submit">Gonder</button>
     </form>
     <p><a href="/panel?key=${key}">Musteri konusmalarini goruntule &rarr;</a></p>
     </body>
@@ -771,14 +785,17 @@ app.post("/broadcast", async (req, res) => {
     const message = (req.body.message || "").trim();
     const imageUrl = (req.body.imageUrl || "").trim();
     const key = escapeHtml(req.query.key || req.body.key);
+    const rawStatusFilter = (req.body.statusFilter || "").trim();
+    const statusFilter = LEAD_STATUSES.some((s) => s.value === rawStatusFilter) ? rawStatusFilter : null;
+    const filterLabel = statusFilter ? leadStatusMeta(statusFilter).label : "Tum musteriler";
 
     if (!message) {
         res.status(400).send("Mesaj bos olamaz.");
         return;
     }
 
-    console.log(`Toplu mesaj baslatildi. Uzunluk: ${message.length}, Resim: ${imageUrl ? "var" : "yok"}`);
-    const summary = await broadcastToAllCustomers(message, imageUrl || null);
+    console.log(`Toplu mesaj baslatildi. Filtre: ${filterLabel}, Uzunluk: ${message.length}, Resim: ${imageUrl ? "var" : "yok"}`);
+    const summary = await broadcastToAllCustomers(message, imageUrl || null, statusFilter);
     console.log(`Toplu mesaj tamamlandi. Toplam: ${summary.total}, Basarili: ${summary.sent}, Basarisiz: ${summary.failed}`);
 
     const rows = summary.results
@@ -804,6 +821,7 @@ app.post("/broadcast", async (req, res) => {
     </head>
     <body>
     <h1>Toplu Mesaj Sonucu</h1>
+    <p>Filtre: <strong>${escapeHtml(filterLabel)}</strong></p>
     <p>Toplam alici: <strong>${summary.total}</strong> — Basarili: <strong>${summary.sent}</strong> — Basarisiz: <strong>${summary.failed}</strong></p>
     <table>
     <thead><tr><th>Alici ID</th><th>Durum</th><th>Not</th></tr></thead>

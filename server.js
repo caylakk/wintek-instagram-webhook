@@ -562,6 +562,10 @@ if (await isDuplicateEvent(dedupKey)) {
     return;
 }
 
+// Yanit suresi raporu icin: musteri mesaji alindigi an, asagidaki cevap
+// gonderim noktalarindan biri tetiklendiginde bu zamana gore olculur.
+const receivedAt = Date.now();
+
 console.log(`DM alindi - Gonderen: ${senderId}, Mesaj: "${incomingText}"`);
 
 touchLastCustomerMessage(senderId);
@@ -588,6 +592,7 @@ if (postback?.payload === "QR_DEALER") {
             { type: "web_url", url: WHATSAPP_LINK, title: "WhatsApp'tan Yaz" },
         ]
     );
+    recordResponseTime("dm", receivedAt);
     setLeadStatus("dm", senderId, "interested");
     notifyAdmin(
         `🏢 <b>Bayilik İlgisi - Instagram DM</b>\n` +
@@ -606,6 +611,7 @@ if (postback?.payload === "QR_SUPPORT") {
         senderId,
         "Teknik destek için ekibimizle doğrudan WhatsApp'tan görüşebilirsiniz, size hemen yardımcı olurlar:"
     );
+    recordResponseTime("dm", receivedAt);
     notifyAdmin(
         `🛠️ <b>Teknik Destek Talebi - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n\n` +
@@ -619,6 +625,7 @@ if (postback?.payload === "QR_RETURN") {
         senderId,
         "İade ve garanti süreçleriyle ilgili ekibimizle WhatsApp'tan görüşebilirsiniz, size en doğru bilgiyi verirler:"
     );
+    recordResponseTime("dm", receivedAt);
     notifyAdmin(
         `🔄 <b>İade/Garanti Talebi - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n\n` +
@@ -640,6 +647,7 @@ if (whatsapp) {
 } else {
     await sendDirectReply(senderId, text);
 }
+recordResponseTime("dm", receivedAt);
 
 if (needsHuman) {
     notifyAdmin(
@@ -670,6 +678,8 @@ if (await isDuplicateEvent(commentId)) {
     return;
 }
 
+const receivedAt = Date.now();
+
 console.log(`Yorum alindi - Yazan: ${commenterId}, Yorum: "${commentText}"`);
 
 incrementWeeklyStat("messages");
@@ -682,6 +692,7 @@ const finalText = whatsapp
     : text;
 
 sendCommentReply(commentId, finalText);
+recordResponseTime("comment", receivedAt);
 
 if (whatsapp) {
     // Fiyat/stok sorusu iceren yorumlarda, yorum cevabinin yanina Meta'nin
@@ -1550,16 +1561,92 @@ async function trackAskedProduct(productTitle) {
     }
 }
 
+// Musteri mesaji alindiktan sonra bot cevabinin fiilen gonderilmesine kadar
+// gecen sureyi olcup biriktirir ("musteri yazdiginda ne kadar surede cevap
+// veriyoruz" sorusunun cevabi). Iki ayri anahtar seti tutulur:
+// - stats:responsetime:sum/count:<tip> -> TTL'siz, tum zamanlarin ortalamasi
+// - stats:responsetime:sum/count:<tip>:<weekKey> -> haftalik ozet raporuna eklenebilsin diye
+// <tip> "dm" ya da "comment" olabilir. DM'lerde olcum, Instagram API'sine gonderim
+// tamamlanana kadarki (await edilen) gercek sureyi kapsar; yorumlarda cevap
+// gonderimi arka planda calistigi icin (sendCommentReply await edilmiyor) olculen
+// sure AI cevabinin hazirlanmasina kadar gecen sureyi yansitir.
+async function recordResponseTime(type, startedAt) {
+    if (!redis) return;
+    try {
+        const elapsedMs = Date.now() - startedAt;
+        if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return;
+
+        const weekKey = getWeekStartKey(getIstanbulNow());
+        const sumKey = `stats:responsetime:sum:${type}`;
+        const countKey = `stats:responsetime:count:${type}`;
+        const weekSumKey = `stats:responsetime:sum:${type}:${weekKey}`;
+        const weekCountKey = `stats:responsetime:count:${type}:${weekKey}`;
+        const maxKey = `stats:responsetime:max:${type}`;
+
+        await Promise.all([
+            redis.incrby(sumKey, elapsedMs),
+            redis.incr(countKey),
+            redis.incrby(weekSumKey, elapsedMs),
+            redis.incr(weekCountKey),
+            redis.expire(weekSumKey, WEEKLY_STATS_TTL_SECONDS),
+            redis.expire(weekCountKey, WEEKLY_STATS_TTL_SECONDS),
+        ]);
+
+        // En yavas cevabi da ayrica tutuyoruz - Render'in ucretsiz plani uykudan
+        // uyanirken olusan anormal gecikmeleri fark edebilmek icin (atomik degil,
+        // ama bu istatistik amacli kullanim icin yeterince guvenilir).
+        const currentMax = Number(await redis.get(maxKey)) || 0;
+        if (elapsedMs > currentMax) {
+            await redis.set(maxKey, elapsedMs);
+        }
+    } catch (err) {
+        console.error(`Yanit suresi kaydedilemedi (${type}):`, err.message);
+    }
+}
+
+async function getResponseTimeStats(type) {
+    if (!redis) return { avgMs: null, count: 0, maxMs: null };
+    try {
+        const [sum, count, max] = await Promise.all([
+            redis.get(`stats:responsetime:sum:${type}`),
+            redis.get(`stats:responsetime:count:${type}`),
+            redis.get(`stats:responsetime:max:${type}`),
+        ]);
+        const countNum = Number(count) || 0;
+        const sumNum = Number(sum) || 0;
+        return {
+            avgMs: countNum > 0 ? sumNum / countNum : null,
+            count: countNum,
+            maxMs: Number(max) || null,
+        };
+    } catch (err) {
+        console.error(`Yanit suresi istatistigi alinamadi (${type}):`, err.message);
+        return { avgMs: null, count: 0, maxMs: null };
+    }
+}
+
+function formatResponseTimeTr(ms) {
+    if (!Number.isFinite(ms) || ms === null) return "henuz veri yok";
+    if (ms < 1000) return "1 saniyeden kisa";
+    if (ms < 60000) return `${Math.round(ms / 1000)} saniye`;
+    const dakika = (ms / 60000).toFixed(1);
+    return `${dakika} dakika`;
+}
+
 function formatDateTr(isoDate) {
     const [y, m, d] = isoDate.split("-");
     return `${d}.${m}.${y}`;
 }
 
 async function buildWeeklyReportMessage(weekKey) {
-    const [messageCount, newLeadCount, topProductsRaw] = await Promise.all([
+    const [messageCount, newLeadCount, topProductsRaw, rtSumDm, rtCountDm, rtSumComment, rtCountComment] = await Promise.all([
         redis.get(`stats:messages:${weekKey}`),
         redis.get(`stats:newleads:${weekKey}`),
         redis.zrange(`stats:products:${weekKey}`, 0, 4, { rev: true, withScores: true }),
+        redis.get(`stats:responsetime:sum:dm:${weekKey}`),
+        redis.get(`stats:responsetime:count:dm:${weekKey}`),
+        redis.get(`stats:responsetime:sum:comment:${weekKey}`),
+        redis.get(`stats:responsetime:count:comment:${weekKey}`),
     ]);
 
     const topProducts = [];
@@ -1570,10 +1657,15 @@ async function buildWeeklyReportMessage(weekKey) {
     const weekEndDate = new Date(`${weekKey}T00:00:00.000Z`);
     weekEndDate.setUTCDate(weekEndDate.getUTCDate() + 6);
 
+    const rtTotalSum = (Number(rtSumDm) || 0) + (Number(rtSumComment) || 0);
+    const rtTotalCount = (Number(rtCountDm) || 0) + (Number(rtCountComment) || 0);
+    const avgResponseText = rtTotalCount > 0 ? formatResponseTimeTr(rtTotalSum / rtTotalCount) : "bu hafta veri yok";
+
     let text =
         `📊 <b>Haftalık Özet (${formatDateTr(weekKey)} - ${formatDateTr(weekEndDate.toISOString().slice(0, 10))})</b>\n\n` +
         `💬 Bu hafta gelen mesaj: <b>${Number(messageCount) || 0}</b>\n` +
-        `🆕 Yeni lead: <b>${Number(newLeadCount) || 0}</b>\n\n`;
+        `🆕 Yeni lead: <b>${Number(newLeadCount) || 0}</b>\n` +
+        `⏱ Ortalama yanıt süresi: <b>${avgResponseText}</b>\n\n`;
 
     if (topProducts.length > 0) {
         text += `🔥 <b>En çok sorulan ürünler:</b>\n`;
@@ -1897,10 +1989,41 @@ app.get("/panel", async (req, res) => {
     </html>`);
 });
 
+function renderResponseTimeHtml(dmStats, commentStats) {
+    const totalCount = dmStats.count + commentStats.count;
+    const combinedAvg = totalCount > 0
+        ? (((dmStats.avgMs || 0) * dmStats.count) + ((commentStats.avgMs || 0) * commentStats.count)) / totalCount
+        : null;
+
+    const row = (label, stats) => `<tr>
+        <td>${escapeHtml(label)}</td>
+        <td>${stats.count > 0 ? formatResponseTimeTr(stats.avgMs) : "henuz veri yok"}</td>
+        <td>${stats.count}</td>
+        <td>${stats.maxMs ? formatResponseTimeTr(stats.maxMs) : "-"}</td>
+    </tr>`;
+
+    return `
+    <h2>Yanit Suresi (Musteri Yazdiktan Bot Cevap Verene Kadar)</h2>
+    <table>
+    <thead><tr><th>Kanal</th><th>Ortalama</th><th>Olcum Sayisi</th><th>En Yavas</th></tr></thead>
+    <tbody>
+    ${row("Direkt Mesaj (DM)", dmStats)}
+    ${row("Gonderi Yorumu", commentStats)}
+    <tr><td><b>Genel</b></td><td><b>${totalCount > 0 ? formatResponseTimeTr(combinedAvg) : "henuz veri yok"}</b></td><td><b>${totalCount}</b></td><td></td></tr>
+    </tbody>
+    </table>
+    <p style="color:#777; font-size:0.85em;">Not: Bu olcum, ozellik eklendigi andan itibaren gelen mesajlarla birikir; gecmis mesajlar icin veri yoktur. "En yavas" deger genelde Render'in ucretsiz plani uykudan uyanirken (ilk mesajlarda 50 saniyeye kadar gecikme olabilir) olusur.</p>
+    `;
+}
+
 app.get("/panel/report", async (req, res) => {
     if (!checkAdminKey(req, res)) return;
     const key = escapeHtml(req.query.key);
-    const report = await buildConversionReport();
+    const [report, dmResponseStats, commentResponseStats] = await Promise.all([
+        buildConversionReport(),
+        getResponseTimeStats("dm"),
+        getResponseTimeStats("comment"),
+    ]);
 
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(`<!DOCTYPE html>
@@ -1923,6 +2046,7 @@ app.get("/panel/report", async (req, res) => {
     </head>
     <body>
     <h1>Satis/Donusum Raporu</h1>
+    ${renderResponseTimeHtml(dmResponseStats, commentResponseStats)}
     ${renderConversionReportHtml(report, key)}
     <div class="nav"><a href="/panel?key=${key}">&larr; Musteri konusmalarina don</a></div>
     </body>

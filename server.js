@@ -574,6 +574,7 @@ if (existingHistory.length === 0) {
     await sendDirectReplyWithButtons(senderId, WELCOME_BUTTONS_SECONDARY_TEXT, WELCOME_BUTTONS_SECONDARY);
     syncLeadToSheet({ kanal: "Instagram DM", musteri: senderId, mesaj: incomingText, durum: "Yeni" });
     incrementWeeklyStat("newleads");
+    ensureLeadCreated("dm", senderId);
 }
 
 // "Bayilik" hazir cevap butonuna basilirsa AI'ya gitmeden dogrudan iki secenek
@@ -672,6 +673,7 @@ if (await isDuplicateEvent(commentId)) {
 console.log(`Yorum alindi - Yazan: ${commenterId}, Yorum: "${commentText}"`);
 
 incrementWeeklyStat("messages");
+ensureLeadCreated("comment", commenterId);
 
 const { text, whatsapp, needsHuman, handoffReason } = await generateAIReply(`conv:comment:${commenterId}`, commentText, 150);
 
@@ -1285,17 +1287,46 @@ async function getLeadStatus(type, id) {
     }
 }
 
+// Bir musteriyle ilk temas anini kalici olarak kaydeder (leadcreated:<tip>:<id>).
+// Satis/donusum raporunda "toplam lead sayisi" ve "ne kadar surede gecti" hesaplarinin
+// baslangic noktasi budur. NX kullanildigi icin ayni musteri icin birden fazla
+// cagirilsa bile (orn. her yorumda) sadece ilk seferinde yazilir, TTL'siz kalir -
+// conv:*/lead: anahtarlarinin aksine 7 gunluk konusma gecmisi suresiyle sinirli degildir.
+async function ensureLeadCreated(type, id) {
+    if (!redis) return;
+    try {
+        await redis.set(`leadcreated:${type}:${id}`, Date.now(), { nx: true });
+    } catch (err) {
+        console.error("Lead olusturma zamani kaydedilemedi:", err.message);
+    }
+}
+
+// Her durum degisikligini (from -> to, ne zaman) kalici bir listeye ekler
+// (leadhistory:<tip>:<id>). Satis/donusum raporu bu listeyi okuyarak "hangi
+// durumdan hangisine ortalama ne kadar surede gecildigini" hesaplar.
+async function recordLeadStatusChange(type, id, fromStatus, toStatus) {
+    if (!redis) return;
+    try {
+        await redis.rpush(`leadhistory:${type}:${id}`, { from: fromStatus, to: toStatus, at: Date.now() });
+    } catch (err) {
+        console.error("Lead durum gecmisi kaydedilemedi:", err.message);
+    }
+}
+
 async function setLeadStatus(type, id, status) {
     if (!redis) return;
     try {
+        const previousStatus = await getLeadStatus(type, id);
+
+        if (previousStatus !== status) {
+            await recordLeadStatusChange(type, id, previousStatus, status);
+        }
+
         // Musteri "Satisa Dondu" durumuna ilk kez geciyorsa, satis sonrasi
         // memnuniyet takibi icin baslangic zamanini kaydet. Zaten "converted"
         // ise (admin ayni durumu tekrar kaydettiyse) sayaci sifirlama.
-        if (type === "dm" && status === "converted") {
-            const previousStatus = await getLeadStatus(type, id);
-            if (previousStatus !== "converted") {
-                await redis.set(`convertedsince:dm:${id}`, Date.now());
-            }
+        if (type === "dm" && status === "converted" && previousStatus !== "converted") {
+            await redis.set(`convertedsince:dm:${id}`, Date.now());
         }
         await redis.set(`lead:${type}:${id}`, status);
     } catch (err) {
@@ -1655,6 +1686,139 @@ function renderConversationThread(history) {
         .join("\n");
 }
 
+// --- Basit satis/donusum raporu ---------------------------------------------
+// leadcreated:<tip>:<id> anahtarlari TTL'siz oldugu icin (conv:*'in aksine 7 gun
+// sonra silinmiyor) "toplam lead" sayisini bu anahtarlardan cikariyoruz - boylece
+// uzun suredir sessiz kalmis ama gecmiste donusmus musteriler de rapora dahil olur.
+async function getAllLeadIds(type) {
+    if (!redis) return [];
+    try {
+        const prefix = `leadcreated:${type}:`;
+        const keys = await redis.keys(`${prefix}*`);
+        return keys.map((k) => k.slice(prefix.length)).filter(Boolean);
+    } catch (err) {
+        console.error("Lead listesi alinamadi:", err.message);
+        return [];
+    }
+}
+
+function formatDurationTr(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "bilinmiyor";
+    if (ms < 60 * 60 * 1000) {
+        const dakika = Math.max(1, Math.round(ms / 60000));
+        return `${dakika} dakika`;
+    }
+    if (ms < 48 * 60 * 60 * 1000) {
+        const saat = Math.round(ms / 3600000);
+        return `${saat} saat`;
+    }
+    const gun = (ms / 86400000).toFixed(1);
+    return `${gun} gün`;
+}
+
+// Tum lead'leri (DM + yorum) tarayip su an hangi durumda olduklarini, genel
+// donusum oranini ve leadhistory kayitlarindan cikan "hangi durumdan hangisine
+// ortalama ne kadar surede gecildigini" hesaplar. leadcreated anini, gecmisteki
+// ilk adimin baslangic noktasi olarak sanal bir "new" girisi gibi kullanir.
+async function buildConversionReport() {
+    if (!redis) {
+        return { totalLeads: 0, statusCounts: {}, conversionRate: 0, transitions: [], redisDisabled: true };
+    }
+
+    const [dmIds, commentIds] = await Promise.all([getAllLeadIds("dm"), getAllLeadIds("comment")]);
+    const allLeads = [
+        ...dmIds.map((id) => ({ type: "dm", id })),
+        ...commentIds.map((id) => ({ type: "comment", id })),
+    ];
+
+    const statusCounts = { new: 0, interested: 0, converted: 0, cold: 0 };
+    const transitionDurations = {}; // "from->to" -> [ms, ms, ...]
+
+    await Promise.all(
+        allLeads.map(async (lead) => {
+            const [status, createdAtRaw, historyRaw] = await Promise.all([
+                getLeadStatus(lead.type, lead.id),
+                redis.get(`leadcreated:${lead.type}:${lead.id}`),
+                redis.lrange(`leadhistory:${lead.type}:${lead.id}`, 0, -1),
+            ]);
+            statusCounts[status] = (statusCounts[status] || 0) + 1;
+
+            const createdAt = Number(createdAtRaw);
+            if (!Number.isFinite(createdAt)) return;
+
+            let previousAt = createdAt;
+            let previousStatus = "new";
+            const history = Array.isArray(historyRaw) ? historyRaw : [];
+            for (const entry of history) {
+                if (!entry || typeof entry.at !== "number" || !entry.to) continue;
+                const transitionKey = `${previousStatus}->${entry.to}`;
+                if (!transitionDurations[transitionKey]) transitionDurations[transitionKey] = [];
+                transitionDurations[transitionKey].push(entry.at - previousAt);
+                previousAt = entry.at;
+                previousStatus = entry.to;
+            }
+        })
+    );
+
+    const totalLeads = allLeads.length;
+    const convertedCount = statusCounts.converted || 0;
+    const conversionRate = totalLeads > 0 ? (convertedCount / totalLeads) * 100 : 0;
+
+    const transitions = Object.entries(transitionDurations)
+        .map(([transitionKey, durations]) => {
+            const [from, to] = transitionKey.split("->");
+            const avgMs = durations.reduce((a, b) => a + b, 0) / durations.length;
+            return { from, to, count: durations.length, avgMs };
+        })
+        .sort((a, b) => b.count - a.count);
+
+    return { totalLeads, statusCounts, conversionRate, transitions };
+}
+
+function renderConversionReportHtml(report, key) {
+    if (report.redisDisabled) {
+        return `<p>Redis baglantisi olmadigi icin rapor hesaplanamiyor.</p>`;
+    }
+
+    const statusRows = LEAD_STATUSES.map((s) => {
+        const count = report.statusCounts[s.value] || 0;
+        const pct = report.totalLeads > 0 ? ((count / report.totalLeads) * 100).toFixed(1) : "0.0";
+        return `<tr>
+            <td><span class="badge" style="background:${s.color}">${escapeHtml(s.label)}</span></td>
+            <td>${count}</td>
+            <td>%${pct}</td>
+        </tr>`;
+    }).join("\n");
+
+    const transitionRows = report.transitions.length > 0
+        ? report.transitions.map((t) => {
+            const fromLabel = escapeHtml(leadStatusMeta(t.from).label);
+            const toLabel = escapeHtml(leadStatusMeta(t.to).label);
+            return `<tr>
+                <td>${fromLabel} &rarr; ${toLabel}</td>
+                <td>${t.count}</td>
+                <td>${escapeHtml(formatDurationTr(t.avgMs))}</td>
+            </tr>`;
+        }).join("\n")
+        : `<tr><td colspan="3">Henuz kayitli bir durum degisikligi yok (panelden musteri durumu guncellendikce burada birikir).</td></tr>`;
+
+    return `
+    <h2>Genel Durum</h2>
+    <table>
+    <thead><tr><th>Durum</th><th>Lead Sayisi</th><th>Oran</th></tr></thead>
+    <tbody>${statusRows}</tbody>
+    </table>
+    <p><b>Toplam lead:</b> ${report.totalLeads} &nbsp; | &nbsp; <b>Donusum orani (Satisa Dondu / Toplam):</b> %${report.conversionRate.toFixed(1)}</p>
+
+    <h2>Durum Gecisleri - Ortalama Sure</h2>
+    <table>
+    <thead><tr><th>Gecis</th><th>Kac Lead</th><th>Ortalama Sure</th></tr></thead>
+    <tbody>${transitionRows}</tbody>
+    </table>
+    <p style="color:#777; font-size:0.85em;">Not: "Yeni" durumu ilk temas anindan itibaren sanal baslangic noktasi olarak alinir; diger tum gecisler panelden musteri durumu elle guncellendikce kaydedilir.</p>
+    `;
+}
+
 app.get("/panel", async (req, res) => {
     if (!checkAdminKey(req, res)) return;
     const key = escapeHtml(req.query.key);
@@ -1715,7 +1879,39 @@ app.get("/panel", async (req, res) => {
     <tbody>${renderPanelRows(filteredComment, "comment", key)}</tbody>
     </table>
 
-    <div class="nav"><a href="/broadcast?key=${key}">&larr; Toplu mesaj sayfasina git</a></div>
+    <div class="nav"><a href="/panel/report?key=${key}">Satis/Donusum Raporu &rarr;</a> &nbsp;|&nbsp; <a href="/broadcast?key=${key}">Toplu mesaj sayfasina git &rarr;</a></div>
+    </body>
+    </html>`);
+});
+
+app.get("/panel/report", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const key = escapeHtml(req.query.key);
+    const report = await buildConversionReport();
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Satis/Donusum Raporu - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+    h1 { font-size: 1.4em; }
+    h2 { font-size: 1.1em; margin-top: 2em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.9em; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+    a { color: #1565c0; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .nav { margin-top: 24px; font-size: 0.9em; }
+    .badge { display: inline-block; padding: 3px 9px; border-radius: 12px; color: #fff; font-size: 0.8em; white-space: nowrap; }
+    </style>
+    </head>
+    <body>
+    <h1>Satis/Donusum Raporu</h1>
+    ${renderConversionReportHtml(report, key)}
+    <div class="nav"><a href="/panel?key=${key}">&larr; Musteri konusmalarina don</a></div>
     </body>
     </html>`);
 });

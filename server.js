@@ -519,7 +519,9 @@ async function generateAIReply(historyKey, userText, maxTokens) {
     }
 
 const history = await getHistory(historyKey);
-    const messages = [...history, { role: "user", content: userText }];
+    // history icindeki kayitlar (ozellikle panelden yazilan admin cevaplari) "source"
+    // gibi ekstra alanlar tasiyabilir; Claude API'ye sadece role/content gonderiyoruz.
+    const messages = [...history.map((m) => ({ role: m.role, content: m.content })), { role: "user", content: userText }];
 
 try {
     const response = await anthropic.messages.create({
@@ -869,7 +871,8 @@ if (needsHuman) {
         `🆘 <b>İnsan Devri Gerekiyor - WhatsApp</b>\n` +
         `Musteri: ${escapeHtml(from)}\n` +
         `Sebep: ${handoffReason === "istek" ? "Musteri gercek biriyle gorusmek istedi" : "Bot anlamli bir cevap uretemedi (hata/bos yanit)"}\n` +
-        `Mesaj: ${escapeHtml(text)}`
+        `Mesaj: ${escapeHtml(text)}\n` +
+        `Konusmayi gor ve cevap yaz: ${PUBLIC_URL}/panel/whatsapp/${encodeURIComponent(from)}?key=${ADMIN_ACCESS_KEY || ""}`
     );
 }
 
@@ -1923,7 +1926,7 @@ function renderConversationThread(history) {
     }
     return history
         .map((m) => {
-            const who = m.role === "user" ? "Musteri" : "Bot";
+            const who = m.role === "user" ? "Musteri" : (m.source === "admin" ? "Sen (Isletme)" : "Bot");
             const cls = m.role === "user" ? "msg-user" : "msg-bot";
             const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
             return `<div class="msg ${cls}"><div class="msg-role">${who}</div><div class="msg-text">${escapeHtml(text)}</div></div>`;
@@ -2257,6 +2260,10 @@ app.get("/panel/:type/:id", async (req, res) => {
     .status-form { margin: 16px 0 24px; padding: 12px 14px; background: #f7f7f7; border-radius: 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .status-form select { padding: 6px 8px; font-size: 0.9em; }
     .status-form button { padding: 6px 14px; font-size: 0.9em; background: #1565c0; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    .reply-form { margin: 24px 0; padding: 14px; background: #f7f7f7; border-radius: 8px; }
+    .reply-form textarea { width: 100%; box-sizing: border-box; min-height: 70px; padding: 8px; font-size: 0.95em; font-family: inherit; border: 1px solid #ccc; border-radius: 6px; resize: vertical; }
+    .reply-form button { margin-top: 8px; padding: 8px 18px; font-size: 0.9em; background: #1565c0; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    .reply-note { font-size: 0.85em; color: #777; margin-top: 20px; }
     </style>
     </head>
     <body>
@@ -2269,8 +2276,47 @@ app.get("/panel/:type/:id", async (req, res) => {
         <button type="submit">Guncelle</button>
     </form>
     ${renderConversationThread(history)}
+    ${(type === "whatsapp" || type === "dm") ? `
+    <form method="POST" action="/panel/${type}/${encodeURIComponent(id)}/reply" class="reply-form">
+        <input type="hidden" name="key" value="${key}">
+        <label for="text"><strong>Musteriye cevap yaz:</strong></label><br>
+        <textarea name="text" id="text" placeholder="Mesajini buraya yaz..." required></textarea>
+        <br>
+        <button type="submit">Gonder</button>
+    </form>
+    ` : `<p class="reply-note">Bu konusma turunde (yorum) panelden dogrudan cevap yazma henuz desteklenmiyor.</p>`}
     </body>
     </html>`);
+});
+
+app.post("/panel/:type/:id/reply", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const { type, id } = req.params;
+    if (type !== "dm" && type !== "whatsapp") {
+        res.status(404).send("Gecersiz konusma turu.");
+        return;
+    }
+    const text = (req.body.text || "").trim();
+    if (!text) {
+        res.status(400).send("Bos mesaj gonderilemez.");
+        return;
+    }
+    try {
+        if (type === "whatsapp") {
+            await sendWhatsAppReply(id, text);
+        } else {
+            await sendDirectReply(id, text);
+        }
+        const historyKey = `conv:${type}:${id}`;
+        const history = await getHistory(historyKey);
+        await saveHistory(historyKey, [...history, { role: "assistant", content: text, source: "admin" }]);
+    } catch (err) {
+        console.error("Panelden cevap gonderme hatasi:", err);
+        res.status(500).send("Mesaj gonderilirken bir hata olustu. Sunucu loglarina bakin.");
+        return;
+    }
+    const key = escapeHtml(req.query.key || req.body.key);
+    res.redirect(`/panel/${type}/${encodeURIComponent(id)}?key=${key}`);
 });
 
 app.post("/panel/:type/:id/status", async (req, res) => {

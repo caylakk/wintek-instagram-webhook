@@ -1690,12 +1690,25 @@ function renderConversationThread(history) {
 // leadcreated:<tip>:<id> anahtarlari TTL'siz oldugu icin (conv:*'in aksine 7 gun
 // sonra silinmiyor) "toplam lead" sayisini bu anahtarlardan cikariyoruz - boylece
 // uzun suredir sessiz kalmis ama gecmiste donusmus musteriler de rapora dahil olur.
+// Bu ozellik eklenmeden once baslamis (leadcreated kaydi olmayan ama hala aktif
+// conv:* gecmisi bulunan) konusmalari da kaybetmemek icin, boyle bir id bulunursa
+// simdi (yaklasik olarak) leadcreated kaydini geriye donuk olusturuyoruz.
 async function getAllLeadIds(type) {
     if (!redis) return [];
     try {
-        const prefix = `leadcreated:${type}:`;
-        const keys = await redis.keys(`${prefix}*`);
-        return keys.map((k) => k.slice(prefix.length)).filter(Boolean);
+        const createdPrefix = `leadcreated:${type}:`;
+        const convPrefix = `conv:${type}:`;
+        const [createdKeys, convKeys] = await Promise.all([
+            redis.keys(`${createdPrefix}*`),
+            redis.keys(`${convPrefix}*`),
+        ]);
+        const createdIds = createdKeys.map((k) => k.slice(createdPrefix.length)).filter(Boolean);
+        const convIds = convKeys.map((k) => k.slice(convPrefix.length)).filter(Boolean);
+
+        const missingIds = convIds.filter((id) => !createdIds.includes(id));
+        await Promise.all(missingIds.map((id) => ensureLeadCreated(type, id)));
+
+        return Array.from(new Set([...createdIds, ...convIds]));
     } catch (err) {
         console.error("Lead listesi alinamadi:", err.message);
         return [];

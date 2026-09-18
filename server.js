@@ -20,6 +20,9 @@ const {
     ADMIN_ACCESS_KEY,
     ADMIN_TELEGRAM_CHAT_ID,
     GOOGLE_SHEETS_WEBHOOK_URL,
+    WHATSAPP_PHONE_NUMBER_ID,
+    WHATSAPP_ACCESS_TOKEN,
+    WHATSAPP_VERIFY_TOKEN,
     PORT = 3000,
 } = process.env;
 
@@ -27,6 +30,7 @@ const WHATSAPP_NUMBER_DISPLAY = "+90 533 556 62 10";
 const WHATSAPP_NUMBER_DIGITS = "905335566210";
 const WHATSAPP_LINK = `https://wa.me/${WHATSAPP_NUMBER_DIGITS}`;
 const WHATSAPP_BUTTON_MARKER = "[[WHATSAPP_BUTTON]]";
+const WHATSAPP_CLOUD_API_VERSION = "v21.0";
 const HUMAN_HANDOFF_MARKER = "[[HUMAN_HANDOFF]]";
 const PUBLIC_URL = RENDER_EXTERNAL_URL || "https://wintek-instagram-webhook.onrender.com";
 const BAYILIK_FORM_URL = `${PUBLIC_URL}/bayilik`;
@@ -60,6 +64,9 @@ if (!TELEGRAM_BOT_TOKEN || !ADMIN_TELEGRAM_CHAT_ID) {
 }
 if (!GOOGLE_SHEETS_WEBHOOK_URL) {
     console.warn("GOOGLE_SHEETS_WEBHOOK_URL tanimli degil - Google Sheets lead aktarimi pasif.");
+}
+if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_ACCESS_TOKEN || !WHATSAPP_VERIFY_TOKEN) {
+    console.warn("WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN / WHATSAPP_VERIFY_TOKEN eksik - WhatsApp bot entegrasyonu pasif.");
 }
 
 const PRODUCT_FEED_URL = "https://winkelgroup.de/api/products/xml";
@@ -438,6 +445,30 @@ app.post("/webhook/telegram", (req, res) => {
     });
 });
 
+// WhatsApp Cloud API, webhook URL'sini Meta panelinden bagliarken bu adrese
+// bir GET istegi atip dogrulama yapar (Instagram'daki /webhook GET'iyle ayni mantik).
+app.get("/webhook/whatsapp", (req, res) => {
+    const mode = req.query["hub.mode"];
+    const token = req.query["hub.verify_token"];
+    const challenge = req.query["hub.challenge"];
+
+    if (mode === "subscribe" && token === WHATSAPP_VERIFY_TOKEN) {
+        console.log("WhatsApp webhook dogrulandi.");
+        return res.status(200).send(challenge);
+    }
+
+    console.warn("WhatsApp webhook dogrulama basarisiz. Token eslesmedi.");
+    return res.status(403).send("Forbidden");
+});
+
+app.post("/webhook/whatsapp", (req, res) => {
+    res.status(200).send("EVENT_RECEIVED");
+
+    handleWhatsAppMessage(req.body).catch((err) => {
+        console.error("WhatsApp webhook hatasi:", err.message);
+    });
+});
+
 // Render'in ucretsiz plani bir sure hareketsiz kalinca uykuya geciyor; servis
 // "uyanirken" Meta/Telegram hizli yanit alamazsa ayni webhook olayini birkac
 // kez tekrar gonderebiliyor. Bu da ayni musteri mesajinin birden fazla kez
@@ -779,6 +810,74 @@ if (productImageUrl) {
 }
 }
 
+// WhatsApp Cloud API'nin webhook govdesi Instagram/Telegram'dan farkli bir yapida
+// gelir: entry[].changes[].value.messages[] icinde metin mesajlari, statuses[]
+// icinde de "iletildi/okundu" gibi durum bildirimleri bulunur. Bizi sadece
+// gercek musteri mesajlari ilgilendiriyor, digerlerini sessizce atliyoruz.
+async function handleWhatsAppMessage(body) {
+    const entries = body?.entry || [];
+    for (const entry of entries) {
+        const changes = entry.changes || [];
+        for (const change of changes) {
+            const value = change.value;
+            const messages = value?.messages || [];
+            for (const message of messages) {
+                await handleSingleWhatsAppMessage(message);
+            }
+        }
+    }
+}
+
+async function handleSingleWhatsAppMessage(message) {
+    const from = message?.from;
+    const text = message?.text?.body;
+
+if (!from || !text) return;
+
+const dedupKey = message?.id;
+if (await isDuplicateEvent(dedupKey)) {
+    console.log(`Tekrar eden WhatsApp mesaji atlandi (id: ${dedupKey})`);
+    return;
+}
+
+console.log(`WhatsApp mesaji alindi - Numara: ${from}, Mesaj: "${text}"`);
+
+touchLastCustomerMessage(from);
+incrementWeeklyStat("messages");
+
+// Yanit suresi raporu icin: musteri mesaji alindigi an, asagidaki cevap
+// gonderim noktalarindan biri tetiklendiginde bu zamana gore olculur.
+const receivedAt = Date.now();
+
+const historyKey = `conv:whatsapp:${from}`;
+const existingHistory = await getHistory(historyKey);
+
+if (existingHistory.length === 0) {
+    await sendWhatsAppReply(from, WELCOME_MESSAGE);
+    syncLeadToSheet({ kanal: "WhatsApp", musteri: from, mesaj: text, durum: "Yeni" });
+    incrementWeeklyStat("newleads");
+    ensureLeadCreated("whatsapp", from);
+}
+
+const { text: replyText, productImageUrl, needsHuman, handoffReason } = await generateAIReply(historyKey, text, 400);
+
+await sendWhatsAppReply(from, replyText);
+recordResponseTime("whatsapp", receivedAt);
+
+if (needsHuman) {
+    notifyAdmin(
+        `🆘 <b>İnsan Devri Gerekiyor - WhatsApp</b>\n` +
+        `Musteri: ${escapeHtml(from)}\n` +
+        `Sebep: ${handoffReason === "istek" ? "Musteri gercek biriyle gorusmek istedi" : "Bot anlamli bir cevap uretemedi (hata/bos yanit)"}\n` +
+        `Mesaj: ${escapeHtml(text)}`
+    );
+}
+
+if (productImageUrl) {
+    await sendWhatsAppImage(from, productImageUrl);
+}
+}
+
 async function sendDirectReply(recipientId, text) {
     const url = `https://graph.instagram.com/v21.0/me/messages`;
 
@@ -1005,6 +1104,58 @@ try {
 } catch (err) {
     console.error(
         `Telegram urun fotografi gonderilemedi -> ${chatId}:`,
+        err.response?.data || err.message
+        );
+}
+}
+
+async function sendWhatsAppReply(to, text) {
+    if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_ACCESS_TOKEN) return;
+    const url = `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+
+try {
+    await axios.post(
+        url,
+        {
+            messaging_product: "whatsapp",
+            to,
+            type: "text",
+            text: { body: text },
+        },
+        {
+            headers: { Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}` },
+        }
+        );
+    console.log(`WhatsApp yaniti gonderildi -> ${to}`);
+} catch (err) {
+    console.error(
+        `WhatsApp yaniti gonderilemedi -> ${to}:`,
+        err.response?.data || err.message
+        );
+}
+}
+
+async function sendWhatsAppImage(to, imageUrl) {
+    if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_ACCESS_TOKEN) return;
+    const url = `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+
+try {
+    await axios.post(
+        url,
+        {
+            messaging_product: "whatsapp",
+            to,
+            type: "image",
+            image: { link: imageUrl },
+        },
+        {
+            headers: { Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}` },
+        }
+        );
+    console.log(`WhatsApp urun fotografi gonderildi -> ${to}`);
+} catch (err) {
+    console.error(
+        `WhatsApp urun fotografi gonderilemedi -> ${to}:`,
         err.response?.data || err.message
         );
 }
@@ -1639,7 +1790,7 @@ function formatDateTr(isoDate) {
 }
 
 async function buildWeeklyReportMessage(weekKey) {
-    const [messageCount, newLeadCount, topProductsRaw, rtSumDm, rtCountDm, rtSumComment, rtCountComment] = await Promise.all([
+    const [messageCount, newLeadCount, topProductsRaw, rtSumDm, rtCountDm, rtSumComment, rtCountComment, rtSumWhatsapp, rtCountWhatsapp] = await Promise.all([
         redis.get(`stats:messages:${weekKey}`),
         redis.get(`stats:newleads:${weekKey}`),
         redis.zrange(`stats:products:${weekKey}`, 0, 4, { rev: true, withScores: true }),
@@ -1647,6 +1798,8 @@ async function buildWeeklyReportMessage(weekKey) {
         redis.get(`stats:responsetime:count:dm:${weekKey}`),
         redis.get(`stats:responsetime:sum:comment:${weekKey}`),
         redis.get(`stats:responsetime:count:comment:${weekKey}`),
+        redis.get(`stats:responsetime:sum:whatsapp:${weekKey}`),
+        redis.get(`stats:responsetime:count:whatsapp:${weekKey}`),
     ]);
 
     const topProducts = [];
@@ -1657,8 +1810,8 @@ async function buildWeeklyReportMessage(weekKey) {
     const weekEndDate = new Date(`${weekKey}T00:00:00.000Z`);
     weekEndDate.setUTCDate(weekEndDate.getUTCDate() + 6);
 
-    const rtTotalSum = (Number(rtSumDm) || 0) + (Number(rtSumComment) || 0);
-    const rtTotalCount = (Number(rtCountDm) || 0) + (Number(rtCountComment) || 0);
+    const rtTotalSum = (Number(rtSumDm) || 0) + (Number(rtSumComment) || 0) + (Number(rtSumWhatsapp) || 0);
+    const rtTotalCount = (Number(rtCountDm) || 0) + (Number(rtCountComment) || 0) + (Number(rtCountWhatsapp) || 0);
     const avgResponseText = rtTotalCount > 0 ? formatResponseTimeTr(rtTotalSum / rtTotalCount) : "bu hafta veri yok";
 
     let text =
@@ -1830,10 +1983,15 @@ async function buildConversionReport() {
         return { totalLeads: 0, statusCounts: {}, conversionRate: 0, transitions: [], redisDisabled: true };
     }
 
-    const [dmIds, commentIds] = await Promise.all([getAllLeadIds("dm"), getAllLeadIds("comment")]);
+    const [dmIds, commentIds, whatsappIds] = await Promise.all([
+        getAllLeadIds("dm"),
+        getAllLeadIds("comment"),
+        getAllLeadIds("whatsapp"),
+    ]);
     const allLeads = [
         ...dmIds.map((id) => ({ type: "dm", id })),
         ...commentIds.map((id) => ({ type: "comment", id })),
+        ...whatsappIds.map((id) => ({ type: "whatsapp", id })),
     ];
 
     const statusCounts = { new: 0, interested: 0, converted: 0, cold: 0 };
@@ -1929,13 +2087,15 @@ app.get("/panel", async (req, res) => {
     const key = escapeHtml(req.query.key);
     const statusFilter = LEAD_STATUSES.some((s) => s.value === req.query.status) ? req.query.status : null;
 
-    const [dmSummaries, commentSummaries] = await Promise.all([
+    const [dmSummaries, commentSummaries, whatsappSummaries] = await Promise.all([
         getConversationSummaries("dm"),
         getConversationSummaries("comment"),
+        getConversationSummaries("whatsapp"),
     ]);
 
     const filteredDm = statusFilter ? dmSummaries.filter((s) => s.leadStatus === statusFilter) : dmSummaries;
     const filteredComment = statusFilter ? commentSummaries.filter((s) => s.leadStatus === statusFilter) : commentSummaries;
+    const filteredWhatsapp = statusFilter ? whatsappSummaries.filter((s) => s.leadStatus === statusFilter) : whatsappSummaries;
 
     const filterLinks = [{ label: "Tumu", value: null }, ...LEAD_STATUSES.map((s) => ({ label: s.label, value: s.value }))]
         .map((f) => {
@@ -1969,7 +2129,7 @@ app.get("/panel", async (req, res) => {
     </style>
     </head>
     <body>
-    <h1>Instagram Musteri Konusmalari</h1>
+    <h1>Musteri Konusmalari (Instagram + WhatsApp)</h1>
     <div class="filters">${filterLinks}</div>
 
     <h2>Direkt Mesajlar (DM)</h2>
@@ -1984,15 +2144,21 @@ app.get("/panel", async (req, res) => {
     <tbody>${renderPanelRows(filteredComment, "comment", key)}</tbody>
     </table>
 
+    <h2>WhatsApp Sohbetleri</h2>
+    <table>
+    <thead><tr><th>Telefon</th><th>Durum</th><th>Mesaj Sayisi</th><th>Son Mesaj</th><th></th></tr></thead>
+    <tbody>${renderPanelRows(filteredWhatsapp, "whatsapp", key)}</tbody>
+    </table>
+
     <div class="nav"><a href="/panel/report?key=${key}">Satis/Donusum Raporu &rarr;</a> &nbsp;|&nbsp; <a href="/broadcast?key=${key}">Toplu mesaj sayfasina git &rarr;</a></div>
     </body>
     </html>`);
 });
 
-function renderResponseTimeHtml(dmStats, commentStats) {
-    const totalCount = dmStats.count + commentStats.count;
+function renderResponseTimeHtml(dmStats, commentStats, whatsappStats) {
+    const totalCount = dmStats.count + commentStats.count + whatsappStats.count;
     const combinedAvg = totalCount > 0
-        ? (((dmStats.avgMs || 0) * dmStats.count) + ((commentStats.avgMs || 0) * commentStats.count)) / totalCount
+        ? (((dmStats.avgMs || 0) * dmStats.count) + ((commentStats.avgMs || 0) * commentStats.count) + ((whatsappStats.avgMs || 0) * whatsappStats.count)) / totalCount
         : null;
 
     const row = (label, stats) => `<tr>
@@ -2009,6 +2175,7 @@ function renderResponseTimeHtml(dmStats, commentStats) {
     <tbody>
     ${row("Direkt Mesaj (DM)", dmStats)}
     ${row("Gonderi Yorumu", commentStats)}
+    ${row("WhatsApp", whatsappStats)}
     <tr><td><b>Genel</b></td><td><b>${totalCount > 0 ? formatResponseTimeTr(combinedAvg) : "henuz veri yok"}</b></td><td><b>${totalCount}</b></td><td></td></tr>
     </tbody>
     </table>
@@ -2019,10 +2186,11 @@ function renderResponseTimeHtml(dmStats, commentStats) {
 app.get("/panel/report", async (req, res) => {
     if (!checkAdminKey(req, res)) return;
     const key = escapeHtml(req.query.key);
-    const [report, dmResponseStats, commentResponseStats] = await Promise.all([
+    const [report, dmResponseStats, commentResponseStats, whatsappResponseStats] = await Promise.all([
         buildConversionReport(),
         getResponseTimeStats("dm"),
         getResponseTimeStats("comment"),
+        getResponseTimeStats("whatsapp"),
     ]);
 
     res.set("Content-Type", "text/html; charset=utf-8");
@@ -2046,7 +2214,7 @@ app.get("/panel/report", async (req, res) => {
     </head>
     <body>
     <h1>Satis/Donusum Raporu</h1>
-    ${renderResponseTimeHtml(dmResponseStats, commentResponseStats)}
+    ${renderResponseTimeHtml(dmResponseStats, commentResponseStats, whatsappResponseStats)}
     ${renderConversionReportHtml(report, key)}
     <div class="nav"><a href="/panel?key=${key}">&larr; Musteri konusmalarina don</a></div>
     </body>
@@ -2056,7 +2224,7 @@ app.get("/panel/report", async (req, res) => {
 app.get("/panel/:type/:id", async (req, res) => {
     if (!checkAdminKey(req, res)) return;
     const { type, id } = req.params;
-    if (type !== "dm" && type !== "comment") {
+    if (type !== "dm" && type !== "comment" && type !== "whatsapp") {
         res.status(404).send("Gecersiz konusma turu.");
         return;
     }
@@ -2108,7 +2276,7 @@ app.get("/panel/:type/:id", async (req, res) => {
 app.post("/panel/:type/:id/status", async (req, res) => {
     if (!checkAdminKey(req, res)) return;
     const { type, id } = req.params;
-    if (type !== "dm" && type !== "comment") {
+    if (type !== "dm" && type !== "comment" && type !== "whatsapp") {
         res.status(404).send("Gecersiz konusma turu.");
         return;
     }

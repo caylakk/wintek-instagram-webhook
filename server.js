@@ -667,6 +667,28 @@ if (postback?.payload === "QR_RETURN") {
     return;
 }
 
+// Toplu kampanya mesajindaki "Ilgileniyorum / Ilgilenmiyorum" butonlarina basilirsa
+// AI'ya hic gitmeden dogrudan lead durumunu guncelliyoruz ve kisa bir tesekkur
+// mesaji yolluyoruz - bot bu konuda ekstra bir yorum uretmeye calismasin diye.
+if (postback?.payload === CAMPAIGN_INTERESTED_PAYLOAD || postback?.payload === CAMPAIGN_NOT_INTERESTED_PAYLOAD) {
+    const interested = postback.payload === CAMPAIGN_INTERESTED_PAYLOAD;
+    await setLeadStatus("dm", senderId, interested ? "interested" : "not_interested");
+    await sendDirectReply(
+        senderId,
+        interested
+            ? "Teşekkürler! İlginizi not aldık, en kısa sürede size ulaşacağız. 🙌"
+            : "Anlaşıldı, teşekkür ederiz! Fikrinizi değiştirirseniz buradayız. 👋"
+    );
+    recordResponseTime("dm", receivedAt);
+    notifyAdmin(
+        `${interested ? "✅" : "🚫"} <b>Kampanya Yaniti - Instagram DM</b>\n` +
+        `Musteri: ${escapeHtml(senderId)}\n` +
+        `Yanit: ${interested ? "Ilgileniyorum" : "Ilgilenmiyorum"}\n\n` +
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+    );
+    return;
+}
+
 const { text, whatsapp, productImageUrl, needsHuman, handoffReason } = await generateAIReply(historyKey, incomingText, 400);
 
 if (whatsapp) {
@@ -833,10 +855,41 @@ async function handleWhatsAppMessage(body) {
 async function handleSingleWhatsAppMessage(message) {
     const from = message?.from;
     const text = message?.text?.body;
+    const buttonReply = message?.interactive?.button_reply;
 
-if (!from || !text) return;
+if (!from) return;
 
 const dedupKey = message?.id;
+
+// Kampanya mesajindaki "Ilgileniyorum / Ilgilenmiyorum" butonlarina basilirsa
+// message.text bos gelir (message.interactive.button_reply doluyor) - bu yuzden
+// asagidaki "!text" erken cikisindan ONCE, AI'ya hic gitmeden burada yakaliyoruz.
+if (buttonReply?.id === CAMPAIGN_INTERESTED_PAYLOAD || buttonReply?.id === CAMPAIGN_NOT_INTERESTED_PAYLOAD) {
+    if (await isDuplicateEvent(dedupKey)) {
+        console.log(`Tekrar eden WhatsApp buton yaniti atlandi (id: ${dedupKey})`);
+        return;
+    }
+    const interested = buttonReply.id === CAMPAIGN_INTERESTED_PAYLOAD;
+    console.log(`WhatsApp kampanya butonu - Numara: ${from}, Yanit: ${interested ? "Ilgileniyorum" : "Ilgilenmiyorum"}`);
+    await setLeadStatus("whatsapp", from, interested ? "interested" : "not_interested");
+    await sendWhatsAppReply(
+        from,
+        interested
+            ? "Teşekkürler! İlginizi not aldık, en kısa sürede size ulaşacağız. 🙌"
+            : "Anlaşıldı, teşekkür ederiz! Fikrinizi değiştirirseniz buradayız. 👋"
+    );
+    recordResponseTime("whatsapp", Date.now());
+    notifyAdmin(
+        `${interested ? "✅" : "🚫"} <b>Kampanya Yaniti - WhatsApp</b>\n` +
+        `Numara: ${escapeHtml(from)}\n` +
+        `Yanit: ${interested ? "Ilgileniyorum" : "Ilgilenmiyorum"}\n\n` +
+        `Konusmayi gor: ${PUBLIC_URL}/panel/whatsapp/${encodeURIComponent(from)}?key=${ADMIN_ACCESS_KEY || ""}`
+    );
+    return;
+}
+
+if (!text) return;
+
 if (await isDuplicateEvent(dedupKey)) {
     console.log(`Tekrar eden WhatsApp mesaji atlandi (id: ${dedupKey})`);
     return;
@@ -1248,8 +1301,65 @@ async function getAllInstagramCustomerIds(statusFilter) {
 // Normal sendDirectReply/sendDirectImage fonksiyonlari hata durumunu disariya
 // dondurmuyor (sessizce logluyor); toplu gonderimde her alici icin gercek
 // basari/hata durumunu raporlayabilmek icin ayri, durum donduren versiyonlar.
-async function sendBroadcastToRecipient(recipientId, message, imageUrl) {
+//
+// includeButtons=true ise mesajin altina "Ilgileniyorum / Ilgilenmiyorum" butonlari
+// eklenir (postback tipinde - Instagram'da kalici buton sablonlarinda kullanilan,
+// zaten calistigi kanitlanmis mekanizma). Butonlar en altta gorunsun diye bu durumda
+// once (varsa) resim, sonra butonlu metin gonderilir; butonsuz gonderimde sira
+// degismedi (once metin, sonra resim).
+async function sendBroadcastToRecipient(recipientId, message, imageUrl, includeButtons) {
     const url = `https://graph.instagram.com/v21.0/me/messages`;
+
+    if (includeButtons) {
+        if (imageUrl) {
+            try {
+                await axios.post(
+                    url,
+                    {
+                        recipient: { id: recipientId },
+                        message: {
+                            attachment: {
+                                type: "image",
+                                payload: { url: imageUrl, is_reusable: true },
+                            },
+                        },
+                    },
+                    { params: { access_token: PAGE_ACCESS_TOKEN } }
+                );
+            } catch (err) {
+                const reason = err.response?.data?.error?.message || err.message;
+                return { ok: false, reason: `Resim gonderilemedi: ${reason}` };
+            }
+        }
+
+        try {
+            await axios.post(
+                url,
+                {
+                    recipient: { id: recipientId },
+                    message: {
+                        attachment: {
+                            type: "template",
+                            payload: {
+                                template_type: "button",
+                                text: message.slice(0, 640),
+                                buttons: [
+                                    { type: "postback", title: "Ilgileniyorum", payload: CAMPAIGN_INTERESTED_PAYLOAD },
+                                    { type: "postback", title: "Ilgilenmiyorum", payload: CAMPAIGN_NOT_INTERESTED_PAYLOAD },
+                                ],
+                            },
+                        },
+                    },
+                },
+                { params: { access_token: PAGE_ACCESS_TOKEN } }
+            );
+        } catch (err) {
+            const reason = err.response?.data?.error?.message || err.message;
+            return { ok: false, reason: imageUrl ? `Resim gonderildi, butonlu mesaj basarisiz: ${reason}` : reason };
+        }
+
+        return { ok: true, reason: null };
+    }
 
     try {
         await axios.post(
@@ -1289,14 +1399,14 @@ async function sendBroadcastToRecipient(recipientId, message, imageUrl) {
     return { ok: true, reason: null };
 }
 
-async function broadcastToAllCustomers(message, imageUrl, statusFilter) {
+async function broadcastToAllCustomers(message, imageUrl, statusFilter, includeButtons) {
     const recipientIds = await getAllInstagramCustomerIds(statusFilter);
     const results = [];
     let sent = 0;
     let failed = 0;
 
     for (const recipientId of recipientIds) {
-        const result = await sendBroadcastToRecipient(recipientId, message, imageUrl);
+        const result = await sendBroadcastToRecipient(recipientId, message, imageUrl, includeButtons);
         if (result.ok) {
             sent += 1;
         } else {
@@ -1304,6 +1414,111 @@ async function broadcastToAllCustomers(message, imageUrl, statusFilter) {
         }
         results.push({ recipientId, ...result });
         // Instagram Graph API rate limitine takilmamak icin gonderimler arasi kucuk bekleme.
+        await sleep(300);
+    }
+
+    return { total: recipientIds.length, sent, failed, results };
+}
+
+// WhatsApp tarafinda kayitli musteri listesi Instagram'daki conv:dm:* ile ayni
+// mantikla, conv:whatsapp:* Redis anahtarlari taranarak cikartilir.
+async function getAllWhatsAppCustomerIds(statusFilter) {
+    if (!redis) return [];
+    try {
+        const keys = await redis.keys("conv:whatsapp:*");
+        let ids = keys.map((k) => k.replace(/^conv:whatsapp:/, "")).filter(Boolean);
+        if (statusFilter) {
+            const statuses = await Promise.all(ids.map((id) => getLeadStatus("whatsapp", id)));
+            ids = ids.filter((_, i) => statuses[i] === statusFilter);
+        }
+        return ids;
+    } catch (err) {
+        console.error("WhatsApp musteri listesi alinamadi:", err.message);
+        return [];
+    }
+}
+
+// Instagram'daki sendBroadcastToRecipient'in WhatsApp Cloud API karsiligi.
+// includeButtons=true ise tek bir "interactive/button" mesaji icinde (opsiyonel
+// resim header + govde metni + iki reply-button) gonderilir - WhatsApp Instagram'in
+// aksine bunu tek API cagrisinda destekliyor. includeButtons=false ise onceki
+// davranis korunur: once metin, sonra (varsa) resim, ayri mesajlar halinde.
+async function sendWhatsAppBroadcastToRecipient(recipientId, message, imageUrl, includeButtons) {
+    if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_ACCESS_TOKEN) {
+        return { ok: false, reason: "WhatsApp entegrasyonu yapilandirilmamis (WHATSAPP_PHONE_NUMBER_ID/WHATSAPP_ACCESS_TOKEN eksik)." };
+    }
+    const url = `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+    const headers = { Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}` };
+
+    if (includeButtons) {
+        const interactive = {
+            type: "button",
+            body: { text: message.slice(0, 1024) },
+            action: {
+                buttons: [
+                    { type: "reply", reply: { id: CAMPAIGN_INTERESTED_PAYLOAD, title: "Ilgileniyorum" } },
+                    { type: "reply", reply: { id: CAMPAIGN_NOT_INTERESTED_PAYLOAD, title: "Ilgilenmiyorum" } },
+                ],
+            },
+        };
+        if (imageUrl) {
+            interactive.header = { type: "image", image: { link: imageUrl } };
+        }
+        try {
+            await axios.post(
+                url,
+                { messaging_product: "whatsapp", to: recipientId, type: "interactive", interactive },
+                { headers }
+            );
+            return { ok: true, reason: null };
+        } catch (err) {
+            const reason = err.response?.data?.error?.message || err.message;
+            return { ok: false, reason };
+        }
+    }
+
+    try {
+        await axios.post(
+            url,
+            { messaging_product: "whatsapp", to: recipientId, type: "text", text: { body: message } },
+            { headers }
+        );
+    } catch (err) {
+        const reason = err.response?.data?.error?.message || err.message;
+        return { ok: false, reason };
+    }
+
+    if (imageUrl) {
+        try {
+            await axios.post(
+                url,
+                { messaging_product: "whatsapp", to: recipientId, type: "image", image: { link: imageUrl } },
+                { headers }
+            );
+        } catch (err) {
+            const reason = err.response?.data?.error?.message || err.message;
+            return { ok: false, reason: `Metin gonderildi, resim basarisiz: ${reason}` };
+        }
+    }
+
+    return { ok: true, reason: null };
+}
+
+async function broadcastToAllWhatsAppCustomers(message, imageUrl, statusFilter, includeButtons) {
+    const recipientIds = await getAllWhatsAppCustomerIds(statusFilter);
+    const results = [];
+    let sent = 0;
+    let failed = 0;
+
+    for (const recipientId of recipientIds) {
+        const result = await sendWhatsAppBroadcastToRecipient(recipientId, message, imageUrl, includeButtons);
+        if (result.ok) {
+            sent += 1;
+        } else {
+            failed += 1;
+        }
+        results.push({ recipientId, ...result });
+        // WhatsApp Cloud API rate limitine takilmamak icin gonderimler arasi kucuk bekleme.
         await sleep(300);
     }
 
@@ -1349,12 +1564,20 @@ app.get("/broadcast", (req, res) => {
     </style>
     </head>
     <body>
-    <h1>Instagram - Toplu Mesaj</h1>
-    <div class="warn">
-    <strong>Onemli:</strong> Bu mesaj, botla daha once konusmus olan ve asagida sectigin durumdaki Instagram musterilerine gonderilmeye calisilacak. Meta'nin kurallari geregi, son 24 saat icinde size yazmamis musterilere gonderim <strong>basarisiz olabilir</strong> — sistem bunu gizlemez, sonuc sayfasinda kime gidip kime gitmedigini gorursunuz. Gonderilen mesajlar geri alinamaz.
+    <h1>Toplu Kampanya Mesaji</h1>
+    <div class="warn" id="warnInstagram">
+    <strong>Onemli (Instagram):</strong> Bu mesaj, botla daha once konusmus olan ve asagida sectigin durumdaki Instagram musterilerine gonderilmeye calisilacak. Meta'nin kurallari geregi, son 24 saat icinde size yazmamis musterilere gonderim <strong>basarisiz olabilir</strong> — sistem bunu gizlemez, sonuc sayfasinda kime gidip kime gitmedigini gorursunuz. Gonderilen mesajlar geri alinamaz.
+    </div>
+    <div class="warn" id="warnWhatsapp" style="display:none;">
+    <strong>Onemli (WhatsApp):</strong> WhatsApp numaramiz henuz dogrulanmadigi icin bu kanal su an gercekten mesaj gonderemez. Ayrica Meta kurallari geregi, isletmenin baslattigi (son 24 saatte size yazmamis) musterilere toplu mesaj icin onceden onayli bir <strong>mesaj sablonu (template)</strong> gerekir ve bu mesajlar ucretlidir; yeni numaralarda gunluk gonderim siniri da vardir. Numara dogrulanip sablon onaylandiginda bu ekrandan gonderim yapilabilecek. Gonderilen mesajlar geri alinamaz.
     </div>
     <form method="POST" action="/broadcast">
     <input type="hidden" name="key" value="${key}">
+    <label for="channel">Kanal</label>
+    <select name="channel" id="channel" onchange="document.getElementById('warnInstagram').style.display = this.value === 'instagram' ? 'block' : 'none'; document.getElementById('warnWhatsapp').style.display = this.value === 'whatsapp' ? 'block' : 'none';">
+    <option value="instagram">Instagram</option>
+    <option value="whatsapp">WhatsApp</option>
+    </select>
     <label for="statusFilter">Kime Gonderilsin</label>
     <select name="statusFilter" id="statusFilter">
     <option value="">Tum musteriler (durumdan bagimsiz)</option>
@@ -1364,6 +1587,10 @@ app.get("/broadcast", (req, res) => {
     <textarea name="message" id="message" required placeholder="Musterilere gonderilecek mesaji yazin..."></textarea>
     <label for="imageUrl">Resim URL (opsiyonel)</label>
     <input type="text" name="imageUrl" id="imageUrl" placeholder="https://... (bos birakilabilir)">
+    <label style="display:flex; align-items:center; gap:8px; font-weight:normal; margin-top:16px;">
+    <input type="checkbox" name="includeButtons" id="includeButtons" value="1" style="width:auto;">
+    <span>Mesajin altina "Ilgileniyorum / Ilgilenmiyorum" butonlarini ekle (kampanya yaniti olarak listelenir)</span>
+    </label>
     <button type="submit">Gonder</button>
     </form>
     <p><a href="/panel?key=${key}">Musteri konusmalarini goruntule &rarr;</a></p>
@@ -1380,14 +1607,19 @@ app.post("/broadcast", async (req, res) => {
     const rawStatusFilter = (req.body.statusFilter || "").trim();
     const statusFilter = LEAD_STATUSES.some((s) => s.value === rawStatusFilter) ? rawStatusFilter : null;
     const filterLabel = statusFilter ? leadStatusMeta(statusFilter).label : "Tum musteriler";
+    const channel = req.body.channel === "whatsapp" ? "whatsapp" : "instagram";
+    const includeButtons = req.body.includeButtons === "1";
 
     if (!message) {
         res.status(400).send("Mesaj bos olamaz.");
         return;
     }
 
-    console.log(`Toplu mesaj baslatildi. Filtre: ${filterLabel}, Uzunluk: ${message.length}, Resim: ${imageUrl ? "var" : "yok"}`);
-    const summary = await broadcastToAllCustomers(message, imageUrl || null, statusFilter);
+    console.log(`Toplu mesaj baslatildi. Kanal: ${channel}, Filtre: ${filterLabel}, Uzunluk: ${message.length}, Resim: ${imageUrl ? "var" : "yok"}, Butonlu: ${includeButtons ? "evet" : "hayir"}`);
+    const summary =
+        channel === "whatsapp"
+            ? await broadcastToAllWhatsAppCustomers(message, imageUrl || null, statusFilter, includeButtons)
+            : await broadcastToAllCustomers(message, imageUrl || null, statusFilter, includeButtons);
     console.log(`Toplu mesaj tamamlandi. Toplam: ${summary.total}, Basarili: ${summary.sent}, Basarisiz: ${summary.failed}`);
 
     const rows = summary.results
@@ -1413,7 +1645,7 @@ app.post("/broadcast", async (req, res) => {
     </head>
     <body>
     <h1>Toplu Mesaj Sonucu</h1>
-    <p>Filtre: <strong>${escapeHtml(filterLabel)}</strong></p>
+    <p>Kanal: <strong>${channel === "whatsapp" ? "WhatsApp" : "Instagram"}</strong> — Filtre: <strong>${escapeHtml(filterLabel)}</strong></p>
     <p>Toplam alici: <strong>${summary.total}</strong> — Basarili: <strong>${summary.sent}</strong> — Basarisiz: <strong>${summary.failed}</strong></p>
     <table>
     <thead><tr><th>Alici ID</th><th>Durum</th><th>Not</th></tr></thead>
@@ -1432,9 +1664,16 @@ app.post("/broadcast", async (req, res) => {
 const LEAD_STATUSES = [
     { value: "new", label: "Yeni", color: "#1565c0" },
     { value: "interested", label: "Ilgileniyor", color: "#f9a825" },
+    { value: "not_interested", label: "Ilgilenmiyor", color: "#c62828" },
     { value: "converted", label: "Satisa Dondu", color: "#2e7d32" },
     { value: "cold", label: "Sogudu", color: "#757575" },
 ];
+
+// Toplu kampanya mesajlarina eklenen "Ilgileniyorum / Ilgilenmiyorum" butonlarinin
+// payload/id degerleri - Instagram (postback.payload) ve WhatsApp (button_reply.id)
+// webhook'larinda ayni sabitlerle karsilastiriliyor.
+const CAMPAIGN_INTERESTED_PAYLOAD = "CAMPAIGN_INTERESTED";
+const CAMPAIGN_NOT_INTERESTED_PAYLOAD = "CAMPAIGN_NOT_INTERESTED";
 const DEFAULT_LEAD_STATUS = "new";
 
 function leadStatusMeta(value) {

@@ -411,19 +411,20 @@ function findLivePriceCandidates(text, contextText = "") {
             const ctx = titleStems.filter((s) => contextStems.has(s) && !currentStems.has(s)).length;
             const pc = normalizeCode(p.code);
             const pb = normalizeCode(p.barcode);
-            let score = cur * 2 + ctx;
-            if (currentCodes.has(pc) || currentCodes.has(pb)) score += 100;
-            else if (codes.has(pc) || codes.has(pb)) score += 50;
-            return { p, score, cur };
+            const codeHit = currentCodes.has(pc) || currentCodes.has(pb);
+            // Son mesajdaki kelimeler her zaman once gelir; onceki mesajlar sadece
+            // esitlikleri bozar (konu degisince eski urunler one gecmesin).
+            const score = (codeHit ? 1000 : 0) + cur * 10 + ctx;
+            return { p, score, cur, codeHit };
         })
-        .filter((x) => x.score >= 2)
+        .filter((x) => x.codeHit || x.cur > 0)
         .sort((a, b) => b.score - a.score);
 
     if (scored.length === 0) return [];
-    // En iyi puanin yarisindan dusuk olanlar alakasiz sayilir.
-    const minScore = Math.max(2, Math.ceil(scored[0].score / 2));
+    // En iyi eslesmenin yarisindan az kelimesi tutan urunler alakasiz sayilir.
+    const best = scored[0];
     return scored
-        .filter((x) => x.score >= minScore)
+        .filter((x) => x.codeHit || best.codeHit || x.cur * 2 >= best.cur)
         .slice(0, LIVE_PRICE_MAX_CANDIDATES)
         .map((x) => x.p);
 }
@@ -448,12 +449,20 @@ async function buildLivePriceSection(userText, history) {
         await refreshBizimHesapProducts();
     }
 
-    const contextText = Array.isArray(history)
-        ? history.slice(-6).map((m) => (typeof m.content === "string" ? m.content : "")).join(" ")
-        : "";
-    const candidates = findLivePriceCandidates(userText, contextText);
+    const recent = Array.isArray(history)
+        ? history.slice(-6).map((m) => (typeof m.content === "string" ? m.content : ""))
+        : [];
+    // Esitlikleri bozmak icin sadece son iki mesaj (son soru-cevap) kullanilir.
+    let candidates = findLivePriceCandidates(userText, recent.slice(-2).join(" "));
+    // Son mesajda urun adi yoksa ("fiyati nedir", "stokta var mi?"), urun adi gecen
+    // EN YAKIN mesaja don - butun konusmayi karistirmadan.
+    if (candidates.length === 0) {
+        for (let i = recent.length - 1; i >= 0 && candidates.length === 0; i--) {
+            candidates = findLivePriceCandidates(recent[i], "");
+        }
+    }
     if (candidates.length === 0) return empty;
-    console.log(`Canli urun eslesmesi: ${candidates.map((p) => `${p.ref || p.code || p.title}${p.photoUrl ? " (foto)" : ""}`).join(", ")}`);
+    console.log(`Canli urun eslesmesi: ${candidates.map((p) => `[${p.ref}] ${p.title.slice(0, 45)}${p.photoUrl ? " (foto)" : ""}`).join(" | ")}`);
 
     const lines = candidates.map((p) => {
         const id = p.ref || p.code || p.barcode;

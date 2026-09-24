@@ -271,7 +271,7 @@ function matchStems(text, stemLength = 5) {
     return new Set(
         normalizeForMatch(text)
             .split(" ")
-            .filter((w) => w.length >= 3 && !PRODUCT_MATCH_STOPWORDS.has(w))
+            .filter((w) => (w.length >= 3 || /^\d+$/.test(w)) && !PRODUCT_MATCH_STOPWORDS.has(w))
             .map((w) => w.slice(0, stemLength))
     );
 }
@@ -326,7 +326,10 @@ async function refreshBizimHesapProducts() {
                     quantity: Number(p.quantity),
                     description: stripHtml(p.ecommerceDescription || p.description || ""),
                     photoUrl: parseBizimHesapPhoto(p.photo),
-                }));
+                }))
+                // Kodu/barkodu olmayan urunler (orn. tasima arabalari) de fotograf
+                // isaretiyle secilebilsin diye her urune bir referans veriyoruz.
+                .map((p, i) => ({ ...p, ref: p.code || p.barcode || `BH-${i + 1}` }));
             bizimhesapLoadedAt = Date.now();
             bizimhesapLastError = null;
             console.log(`BizimHesap fiyat/stok guncellendi: ${bizimhesapProducts.length} urun, ${bizimhesapProducts.filter((p) => p.photoUrl).length} tanesinde foto var.`);
@@ -450,10 +453,10 @@ async function buildLivePriceSection(userText, history) {
         : "";
     const candidates = findLivePriceCandidates(userText, contextText);
     if (candidates.length === 0) return empty;
-    console.log(`Canli urun eslesmesi: ${candidates.map((p) => `${p.code || p.barcode || p.title}${p.photoUrl ? " (foto)" : ""}`).join(", ")}`);
+    console.log(`Canli urun eslesmesi: ${candidates.map((p) => `${p.ref || p.code || p.title}${p.photoUrl ? " (foto)" : ""}`).join(", ")}`);
 
     const lines = candidates.map((p) => {
-        const id = p.code || p.barcode;
+        const id = p.ref || p.code || p.barcode;
         const code = id ? `[${id}] ` : "";
         const price = Number.isFinite(p.price) && p.price > 0 ? `Fiyat: ${formatPriceTr(p.price, p.currency)} + KDV` : "Fiyat: sistemde yok";
         const stock = Number.isFinite(p.quantity) ? (p.quantity > 0 ? "Stokta var" : "Stokta yok") : "Stok bilgisi yok";
@@ -468,7 +471,7 @@ CANLI FİYAT, STOK VE ÜRÜN BİLGİSİ (muhasebe sistemimizden az önce çekild
 ${lines.join("\n")}
 
 9. Müşteri fiyat veya stok sorarsa ve sorduğu ürün yukarıdaki CANLI listede varsa, 2. kuraldaki kısıtlama o ürün için GEÇERLİ DEĞİLDİR: fiyatı listede yazdığı gibi "... TL + KDV" şeklinde ver (KDV hariç olduğunu mutlaka belirt, KDV'yi kendin ekleyip hesaplama) ve stok için sadece "stokta var" ya da "stokta yok" de; adet veya miktar ASLA söyleme. Ürünü sunarken yukarıdaki açıklamayı kullan. Ürün kodunu ve adını listede yazdığı gibi, müşterinin istediği özelliklere (kaplama, renk, beden vb.) BİREBİR uyan satırdan al; uyan satır yoksa bunu söyle ve farkı belirterek en yakın seçeneği sor. Birden fazla uygun ürün varsa en fazla 3 tanesini fiyatlarıyla kısaca say ya da hangisini kastettiğini sor. Ürün "Stokta yok" ise bunu nazikçe söyle ve temin süresi için WhatsApp'tan yazabileceğini belirt (bu durumda WhatsApp işaretini ekle). Fiyatı "sistemde yok" olan ya da listede hiç bulunmayan ürünlerde 2. kuraldaki gibi WhatsApp'a yönlendir.
-10. Müşteriye belirli bir ürünü sunuyorsan ve o ürünün satırında "Fotoğraf: var" yazıyorsa, cevabının en sonuna (ayrı bir satırda) tam olarak [[PRODUCT_IMAGE:KOD]] ekle; KOD, o satırın başındaki köşeli parantez içindeki koddur. Bir cevapta en fazla bir fotoğraf işareti kullan ve sadece müşterinin istediği özelliklere uyan ürünün fotoğrafını gönder.`;
+10. Müşteriye belirli bir ürünü sunuyorsan ve o ürünün satırında "Fotoğraf: var" yazıyorsa, cevabının en sonuna (ayrı bir satırda) tam olarak [[PRODUCT_IMAGE:KOD]] ekle; KOD, o satırın başındaki köşeli parantez içindeki koddur. Bir cevapta en fazla bir fotoğraf işareti kullan ve sadece müşterinin istediği özelliklere uyan ürünün fotoğrafını gönder. Müşteri fotoğraf isterse ve konuşulan ürünün satırında "Fotoğraf: var" yazıyorsa ASLA "fotoğraf yok" deme; "Fotoğrafını hemen gönderiyorum" gibi kısa bir cümle yaz ve işareti ekle.`;
     return { section, candidates };
 }
 
@@ -486,7 +489,9 @@ function findLiveProductInReply(candidates, replyText) {
     });
     if (byCode.length === 1) return byCode[0];
 
-    const replyStems = matchStems(replyText, LIVE_STEM_LENGTH);
+    // Fiyatlardaki rakamlar ("7.200,00 TL") urun adindaki rakamlarla karismasin.
+    const replyWithoutPrices = String(replyText).replace(/\d[\d.,]*\s*(?:tl|try|₺)/gi, " ");
+    const replyStems = matchStems(replyWithoutPrices, LIVE_STEM_LENGTH);
     const scored = withPhoto
         .map((p) => {
             const ts = [...matchStems(p.title, LIVE_STEM_LENGTH)];
@@ -878,7 +883,7 @@ try {
             // Winkel kataloğunda yoksa BizimHesap'taki urun fotografina bak.
             const wanted = normalizeCode(barcode);
             const bhProduct = bizimhesapProducts.find(
-                (p) => p.photoUrl && wanted && (normalizeCode(p.code) === wanted || normalizeCode(p.barcode) === wanted)
+                (p) => p.photoUrl && wanted && (normalizeCode(p.ref) === wanted || normalizeCode(p.code) === wanted || normalizeCode(p.barcode) === wanted)
             );
             if (bhProduct) {
                 productImageUrl = bhProduct.photoUrl;

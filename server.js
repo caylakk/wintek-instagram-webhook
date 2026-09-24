@@ -321,7 +321,11 @@ async function refreshBizimHesapProducts() {
                     code: String(p.code || "").trim(),
                     barcode: String(p.barcode || "").trim(),
                     title: [String(p.title).trim(), p.variant ? String(p.variant).trim() : ""].filter(Boolean).join(" - "),
-                    price: Number(p.variantPrice || p.price),
+                    // BizimHesap API'si fiyati KDV DAHIL veriyor (orn. 129,60 = 108,00 + %20).
+                    // Musteriye "+ KDV" diye KDV haric fiyati soyledigimiz icin tax alanindaki
+                    // oranla KDV'yi cikariyoruz. Oran bos gelirse: eldivenlerde %10, digerlerinde %20.
+                    priceInclVat: Number(p.variantPrice || p.price),
+                    price: vatExclusivePrice(Number(p.variantPrice || p.price), p.tax, p.title),
                     currency: p.currency || "TL",
                     quantity: Number(p.quantity),
                     description: stripHtml(p.ecommerceDescription || p.description || ""),
@@ -366,6 +370,14 @@ function stripHtml(text) {
         .replace(/&[a-z]+;/gi, " ")
         .replace(/\s+/g, " ")
         .trim();
+}
+
+function vatExclusivePrice(priceInclVat, taxRate, title) {
+    if (!Number.isFinite(priceInclVat) || priceInclVat <= 0) return priceInclVat;
+    const hasRate = taxRate !== null && taxRate !== undefined && taxRate !== "" && Number.isFinite(Number(taxRate));
+    const defaultRate = /eldiven/i.test(normalizeForMatch(title)) ? 10 : 20;
+    const rate = hasRate ? Number(taxRate) : defaultRate;
+    return Math.round((priceInclVat / (1 + rate / 100)) * 100) / 100;
 }
 
 function normalizeCode(code) {

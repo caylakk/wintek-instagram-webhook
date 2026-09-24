@@ -727,6 +727,7 @@ async function handleFormSubmission({ type, emoji, title, fields, adSoyad, epost
 }
 
 const clean = (v, max = 2000) => String(v || "").trim().slice(0, max);
+const isValidEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || ""));
 
 app.get("/teknik-destek", (req, res) => {
     res.set("Content-Type", "text/html; charset=utf-8");
@@ -743,8 +744,8 @@ app.get("/teknik-destek", (req, res) => {
     <input type="text" name="firma" id="firma">
     <label for="telefon">Telefon <span class="req">*</span></label>
     <input type="tel" name="telefon" id="telefon" required>
-    <label for="eposta">E-posta</label>
-    <input type="email" name="eposta" id="eposta">
+    <label for="eposta">E-posta <span class="req">*</span></label>
+    <input type="email" name="eposta" id="eposta" required>
     <label for="urun">Ürün Adı / Kodu <span class="req">*</span></label>
     <input type="text" name="urun" id="urun" placeholder="örn. Fren Balata Temizleme Sprey / W170119" required>
     <label for="sorun">Sorunun Açıklaması <span class="req">*</span></label>
@@ -763,7 +764,7 @@ app.post("/teknik-destek", async (req, res) => {
     const eposta = clean(req.body.eposta, 120);
     const urun = clean(req.body.urun, 200);
     const sorun = clean(req.body.sorun);
-    if (!adSoyad || !telefon || !urun || !sorun || req.body.onay !== "1") {
+    if (!adSoyad || !telefon || !isValidEmail(eposta) || !urun || !sorun || req.body.onay !== "1") {
         res.status(400).send("Lütfen zorunlu alanları doldurup onay kutusunu işaretleyin ve tekrar deneyin.");
         return;
     }
@@ -794,8 +795,8 @@ app.get("/iade-garanti", (req, res) => {
     <input type="text" name="adSoyad" id="adSoyad" required>
     <label for="telefon">Telefon <span class="req">*</span></label>
     <input type="tel" name="telefon" id="telefon" required>
-    <label for="eposta">E-posta</label>
-    <input type="email" name="eposta" id="eposta">
+    <label for="eposta">E-posta <span class="req">*</span></label>
+    <input type="email" name="eposta" id="eposta" required>
     <label for="talepTuru">Talep Türü <span class="req">*</span></label>
     <select name="talepTuru" id="talepTuru" required>
         <option value="">Seçiniz</option>
@@ -828,7 +829,7 @@ app.post("/iade-garanti", async (req, res) => {
     const tarih = clean(req.body.tarih, 20);
     const urun = clean(req.body.urun, 200);
     const aciklama = clean(req.body.aciklama);
-    if (!adSoyad || !telefon || !talepTuru || !urun || !aciklama || req.body.onay !== "1") {
+    if (!adSoyad || !telefon || !isValidEmail(eposta) || !talepTuru || !urun || !aciklama || req.body.onay !== "1") {
         res.status(400).send("Lütfen zorunlu alanları doldurup onay kutusunu işaretleyin ve tekrar deneyin.");
         return;
     }
@@ -879,8 +880,8 @@ app.get("/bayilik", (req, res) => {
     <input type="tel" name="telefon" id="telefon" required>
     <label for="sehir">Şehir</label>
     <input type="text" name="sehir" id="sehir">
-    <label for="eposta">E-posta</label>
-    <input type="email" name="eposta" id="eposta">
+    <label for="eposta">E-posta <span class="req">*</span></label>
+    <input type="email" name="eposta" id="eposta" required>
     <label for="not">Not / Mesaj</label>
     <textarea name="not" id="not" placeholder="Ilgilendiginiz urunler, mevcut is alaniniz vb. (opsiyonel)"></textarea>
     <button type="submit">Başvuruyu Gönder</button>
@@ -897,8 +898,8 @@ app.post("/bayilik", async (req, res) => {
     const eposta = (req.body.eposta || "").trim();
     const not = (req.body.not || "").trim();
 
-    if (!adSoyad || !firma || !telefon) {
-        res.status(400).send("Ad Soyad, Firma ve Telefon alanlari zorunludur. Lutfen geri donup formu eksiksiz doldurun.");
+    if (!adSoyad || !firma || !telefon || !isValidEmail(eposta)) {
+        res.status(400).send("Ad Soyad, Firma, Telefon ve gecerli bir E-posta zorunludur. Lutfen geri donup formu eksiksiz doldurun.");
         return;
     }
 

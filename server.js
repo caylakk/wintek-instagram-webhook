@@ -88,6 +88,16 @@ function extractTag(block, tag) {
     return match ? decodeCData(match[1]) : "";
 }
 
+// Instagram ve WhatsApp mesaj API'leri WebP/AVIF resimleri kabul etmiyor
+// ("This attachment format is not supported" hatasi). Urun fotograflari
+// Cloudinary'de duruyor ve Cloudinary, URL'deki dosya uzantisina gore formati
+// aninda donusturuyor - bu yuzden .webp/.avif uzantisini .jpg yapmak yeterli.
+// Cloudinary disindaki adreslere dokunulmaz.
+function toMessagingSafeImageUrl(url) {
+    if (!url || !/res\.cloudinary\.com\//i.test(url)) return url;
+    return url.replace(/\.(webp|avif)(?=($|[?#]))/i, ".jpg");
+}
+
 function extractImages(block) {
     // (?=[\s>]) tag-siniri zorunlu kilar: <images> konteynir etiketini
     // <image ...> ile karistirmayi onler ("s" harfi [^>]* tarafindan yutulup
@@ -95,7 +105,8 @@ function extractImages(block) {
     const matches = [...block.matchAll(/<image(?=[\s>])[^>]*>([\s\S]*?)<\/image>/gi)];
     return matches
         .map((m) => decodeCData(m[1]))
-        .filter((url) => url && /^https?:\/\//i.test(url));
+        .filter((url) => url && /^https?:\/\//i.test(url))
+        .map(toMessagingSafeImageUrl);
 }
 
 function parseProductFeed(xml) {
@@ -1602,7 +1613,7 @@ app.post("/broadcast", async (req, res) => {
     if (!checkAdminKey(req, res)) return;
 
     const message = (req.body.message || "").trim();
-    const imageUrl = (req.body.imageUrl || "").trim();
+    const imageUrl = toMessagingSafeImageUrl((req.body.imageUrl || "").trim());
     const key = escapeHtml(req.query.key || req.body.key);
     const rawStatusFilter = (req.body.statusFilter || "").trim();
     const statusFilter = LEAD_STATUSES.some((s) => s.value === rawStatusFilter) ? rawStatusFilter : null;

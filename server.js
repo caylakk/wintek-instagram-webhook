@@ -69,6 +69,24 @@ if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_ACCESS_TOKEN || !WHATSAPP_VERIFY_TOKE
     console.warn("WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN / WHATSAPP_VERIFY_TOKEN eksik - WhatsApp bot entegrasyonu pasif.");
 }
 
+// --- BizimHesap canli fiyat/stok -------------------------------------------
+// Firmaya ozel token Render'da BIZIMHESAP_TOKEN (ya da STOCK_API_KEY) adiyla durur.
+// "Key" basligi ise BizimHesap dokumaninda tum B2B entegrasyonlari icin ortak
+// yazilan, herkese acik sabit degerdir (firmaya ozel degildir).
+const BIZIMHESAP_TOKEN = process.env.BIZIMHESAP_TOKEN || process.env.STOCK_API_KEY;
+const BIZIMHESAP_PRODUCTS_URL = "https://bizimhesap.com/api/b2b/products";
+const BIZIMHESAP_PUBLIC_KEY = "BZMHB2B724018943908D0B82491F203F";
+const BIZIMHESAP_REFRESH_MS = 15 * 60 * 1000;
+const LIVE_PRICE_MAX_CANDIDATES = 6;
+let bizimhesapProducts = [];
+let bizimhesapLoadedAt = 0;
+let bizimhesapLoading = null;
+let bizimhesapLastError = null;
+
+if (!BIZIMHESAP_TOKEN) {
+    console.warn("BIZIMHESAP_TOKEN (veya STOCK_API_KEY) tanimli degil - canli fiyat/stok cevaplari pasif.");
+}
+
 const PRODUCT_FEED_URL = "https://winkelgroup.de/api/products/xml";
 const PRODUCT_FEED_REFRESH_MS = 6 * 60 * 60 * 1000;
 const PRODUCT_IMAGE_MARKER_REGEX = /\[\[PRODUCT_IMAGE:([A-Za-z0-9._-]+)\]\]/;
@@ -186,9 +204,9 @@ KURALLAR:
 6. Konuşmanın başında müşteriye otomatik bir karşılama mesajı zaten gönderiliyor. Bu yüzden sen ayrıca "hoş geldiniz", "merhaba" gibi bir karşılama cümlesiyle başlama; doğrudan müşterinin sorusuna veya talebine odaklan.
 7. Eğer müşteri açıkça gerçek bir yetkili/insanla görüşmek istediğini belirtirse (örneğin: "gerçek biriyle konuşmak istiyorum", "bir yetkiliye bağlar mısınız", "insanla görüşebilir miyim", "müşteri temsilcisi istiyorum" gibi), onu nazikçe yönlendiren kısa bir cevap ver (örn: "Elbette, ekibimizden biri en kısa sürede sizinle ilgilenecek.") ve cevabının en sonuna başka hiçbir şey eklemeden tam olarak şu işareti ekle: ${HUMAN_HANDOFF_MARKER}`;
 
-function buildSystemPrompt() {
+function buildSystemPrompt(liveSection = "") {
     if (productsWithImages.length === 0) {
-        return BASE_SYSTEM_PROMPT;
+        return `${BASE_SYSTEM_PROMPT}${liveSection}`;
     }
 
     const lines = productsWithImages
@@ -202,7 +220,7 @@ ${lines}
 
 8. Müşteri yukarıdaki listede bulunan bir ürünü soruyorsa ya da adını yazıyorsa, cevabının en sonuna (varsa WhatsApp/insan devri işaretlerinden sonra, ayrı bir satırda) tam olarak şu formatta ekle: [[PRODUCT_IMAGE:BARKOD]] — BARKOD yerine yukarıdaki listeden ilgili ürünün gerçek barkodunu yaz. Müşteri ürün adını birebir yazmak zorunda değil: yakın ya da kısmi bir ad yazdıysa (örn. "fren balata temizleyici" → "Fren Balata Temizleme Sprey") ve listede buna açıkça karşılık gelen TEK bir ürün varsa, o ürünün barkoduyla işareti ekle. Listede karşılığı olmayan ya da birden fazla ürünün aynı ölçüde uyduğu durumlarda bu işareti kullanma; bu durumda elinde o ürünün fotoğrafı olmadığını söyleyip normal şekilde yardımcı ol.`;
 
-    return `${BASE_SYSTEM_PROMPT}${catalogSection}`;
+    return `${BASE_SYSTEM_PROMPT}${catalogSection}${liveSection}`;
 }
 
 // Yapay zeka [[PRODUCT_IMAGE:...]] isaretini koymayi unuttugunda devreye giren
@@ -255,6 +273,126 @@ function findProductMentionedInText(userText, replyText) {
     if (scored.length > 1 && scored[1].hits.length === best.hits.length) return null;
     if (!best.hits.some((s) => replyStems.has(s))) return null;
     return best.product;
+}
+
+// --- BizimHesap canli fiyat/stok fonksiyonlari -------------------------------
+async function refreshBizimHesapProducts() {
+    if (!BIZIMHESAP_TOKEN) return;
+    if (bizimhesapLoading) return bizimhesapLoading;
+    bizimhesapLoading = (async () => {
+        try {
+            const res = await axios.get(BIZIMHESAP_PRODUCTS_URL, {
+                headers: { Key: BIZIMHESAP_PUBLIC_KEY, Token: BIZIMHESAP_TOKEN },
+                timeout: 20000,
+            });
+            const body = res.data || {};
+            const apiError = body.resultCode === 0 ? body.errorText : body.error || body.Message;
+            if (apiError) {
+                bizimhesapLastError = String(apiError);
+                console.error("BizimHesap urun listesi hatasi:", apiError);
+                return;
+            }
+            const list = body?.data?.products || [];
+            bizimhesapProducts = list
+                .filter((p) => p && p.title && p.isActive !== false)
+                .map((p) => ({
+                    code: String(p.code || "").trim(),
+                    barcode: String(p.barcode || "").trim(),
+                    title: [String(p.title).trim(), p.variant ? String(p.variant).trim() : ""].filter(Boolean).join(" - "),
+                    price: Number(p.variantPrice || p.price),
+                    currency: p.currency || "TL",
+                    quantity: Number(p.quantity),
+                }));
+            bizimhesapLoadedAt = Date.now();
+            bizimhesapLastError = null;
+            console.log(`BizimHesap fiyat/stok guncellendi: ${bizimhesapProducts.length} urun.`);
+        } catch (err) {
+            bizimhesapLastError = `${err.response?.status || ""} ${err.message}`.trim();
+            console.error("BizimHesap urun listesi alinamadi:", err.response?.status || "", err.response?.data || err.message);
+        } finally {
+            bizimhesapLoading = null;
+        }
+    })();
+    return bizimhesapLoading;
+}
+
+function normalizeCode(code) {
+    return String(code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// Metindeki Winkel artikel numaralarini (W170112, W-170-112, w 170112 ...) bulur.
+function extractArticleCodes(text) {
+    const matches = String(text || "").match(/\bw[\s-]?\d{3}[\s-]?\d{3}(?:-[a-z]{1,4})?\b/gi) || [];
+    return new Set(matches.map(normalizeCode));
+}
+
+function formatPriceTr(price, currency) {
+    const cur = !currency || /^(try|tl)$/i.test(currency) ? "TL" : currency;
+    return `${price.toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${cur}`;
+}
+
+// Musterinin mesajiyla eslesen BizimHesap urunlerini bulur: once artikel numarasi
+// (W170112 gibi; winkelgroup.de feed'inde isimle bulunan urunlerin barkodu da
+// buraya eklenir), sonra urun adindaki kelimeler (Faba eldiven, Wintek eldiven...).
+function findLivePriceCandidates(text) {
+    if (bizimhesapProducts.length === 0) return [];
+
+    const codes = extractArticleCodes(text);
+    const queryStems = matchStems(text);
+    for (const p of productCatalog) {
+        const hits = [...matchStems(p.title)].filter((s) => queryStems.has(s));
+        if (hits.length >= 2) codes.add(normalizeCode(p.barcode));
+    }
+
+    const byCode = bizimhesapProducts.filter(
+        (p) => codes.has(normalizeCode(p.code)) || codes.has(normalizeCode(p.barcode))
+    );
+
+    const byName = queryStems.size === 0 ? [] : bizimhesapProducts
+        .map((p) => ({ p, hits: [...matchStems(p.title)].filter((s) => queryStems.has(s)).length }))
+        .filter((x) => x.hits >= 1)
+        .sort((a, b) => b.hits - a.hits);
+    const bestHits = byName.length > 0 ? byName[0].hits : 0;
+    const nameMatches = byName.filter((x) => x.hits === bestHits).map((x) => x.p);
+
+    const result = [];
+    for (const p of [...byCode, ...nameMatches]) {
+        if (!result.includes(p)) result.push(p);
+        if (result.length >= LIVE_PRICE_MAX_CANDIDATES) break;
+    }
+    return result;
+}
+
+// Yapay zekaya verilecek canli fiyat/stok bolumu. Stok ADEDI bilerek hic
+// yazilmiyor - yapay zeka sadece "stokta var / yok" gordugu icin adet sizdiramaz.
+async function buildLivePriceSection(userText, history) {
+    if (!BIZIMHESAP_TOKEN) return "";
+    if (bizimhesapProducts.length === 0 || Date.now() - bizimhesapLoadedAt > BIZIMHESAP_REFRESH_MS) {
+        await refreshBizimHesapProducts();
+    }
+
+    // Once sadece son mesaja bak; eslesme yoksa ("stokta var mi?" gibi devam
+    // sorulari) konusmanin son birkac mesajindaki urun adlarina bak.
+    let candidates = findLivePriceCandidates(userText);
+    if (candidates.length === 0 && Array.isArray(history)) {
+        const recent = history.slice(-4).map((m) => (typeof m.content === "string" ? m.content : "")).join(" ");
+        candidates = findLivePriceCandidates(recent);
+    }
+    if (candidates.length === 0) return "";
+
+    const lines = candidates.map((p) => {
+        const code = p.code ? `[${p.code}] ` : "";
+        const price = Number.isFinite(p.price) && p.price > 0 ? `Fiyat: ${formatPriceTr(p.price, p.currency)} + KDV` : "Fiyat: sistemde yok";
+        const stock = Number.isFinite(p.quantity) ? (p.quantity > 0 ? "Stokta var" : "Stokta yok") : "Stok bilgisi yok";
+        return `- ${code}${p.title} — ${price} — ${stock}`;
+    });
+
+    return `
+
+CANLI FİYAT VE STOK BİLGİSİ (muhasebe sistemimizden az önce çekildi; müşterinin mesajıyla eşleşen ürünler):
+${lines.join("\n")}
+
+9. Müşteri fiyat veya stok sorarsa ve sorduğu ürün yukarıdaki CANLI listede varsa, 2. kuraldaki kısıtlama o ürün için GEÇERLİ DEĞİLDİR: fiyatı listede yazdığı gibi "... TL + KDV" şeklinde ver (KDV hariç olduğunu mutlaka belirt, KDV'yi kendin ekleyip hesaplama) ve stok için sadece "stokta var" ya da "stokta yok" de; adet veya miktar ASLA söyleme. Listede sorulana benzeyen birden fazla ürün varsa en fazla 3 tanesini fiyatlarıyla kısaca say ya da hangisini kastettiğini sor. Ürün "Stokta yok" ise bunu nazikçe söyle ve temin süresi için WhatsApp'tan yazabileceğini belirt (bu durumda WhatsApp işaretini ekle). Fiyatı "sistemde yok" olan ya da listede hiç bulunmayan ürünlerde 2. kuraldaki gibi WhatsApp'a yönlendir.`;
 }
 
 app.get("/webhook", (req, res) => {
@@ -587,10 +725,17 @@ const history = await getHistory(historyKey);
     const messages = [...history.map((m) => ({ role: m.role, content: m.content })), { role: "user", content: userText }];
 
 try {
+    let liveSection = "";
+    try {
+        liveSection = await buildLivePriceSection(userText, history);
+    } catch (err) {
+        console.error("Canli fiyat/stok bolumu olusturulamadi:", err.message);
+    }
+
     const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: maxTokens,
-        system: buildSystemPrompt(),
+        system: buildSystemPrompt(liveSection),
         messages,
     });
 
@@ -2669,13 +2814,36 @@ app.get("/admin/run-weekly-report", async (req, res) => {
     res.send("Haftalik ozet raporu (test) calistirildi. Sonuclar icin sunucu loglarina bakin.");
 });
 
-Promise.all([refreshProductCatalog(), setupTelegramWebhook()]).finally(() => {
+// Canli fiyat/stok entegrasyonunu kontrol etmek icin: kac urun cekildigi, son
+// hata ve (q= verilirse) o mesaj icin yapay zekaya gidecek canli bolum. Stok
+// adedi burada da gosterilmez.
+app.get("/admin/bizimhesap-check", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    if (!BIZIMHESAP_TOKEN) {
+        res.type("text/plain; charset=utf-8").send("BIZIMHESAP_TOKEN (veya STOCK_API_KEY) Render'da tanimli degil.");
+        return;
+    }
+    await refreshBizimHesapProducts();
+    const q = String(req.query.q || "");
+    const section = q ? await buildLivePriceSection(q, []) : "";
+    const lines = [
+        `Cekilen urun sayisi: ${bizimhesapProducts.length}`,
+        `Son guncelleme: ${bizimhesapLoadedAt ? new Date(bizimhesapLoadedAt).toISOString() : "henuz yok"}`,
+        `Son hata: ${bizimhesapLastError || "yok"}`,
+        "",
+        q ? `"${q}" icin yapay zekaya gidecek bilgi:${section || "\n(eslesen urun yok)"}` : "Deneme icin adrese &q=faba eldiven gibi bir mesaj ekleyin.",
+    ];
+    res.type("text/plain; charset=utf-8").send(lines.join("\n"));
+});
+
+Promise.all([refreshProductCatalog(), setupTelegramWebhook(), refreshBizimHesapProducts()]).finally(() => {
     app.listen(PORT, () => {
         console.log(`Webhook sunucusu http://localhost:${PORT}/webhook adresinde calisiyor`);
     });
 });
 
 setInterval(refreshProductCatalog, PRODUCT_FEED_REFRESH_MS);
+setInterval(refreshBizimHesapProducts, BIZIMHESAP_REFRESH_MS);
 setInterval(runInterestedFollowupCheck, FOLLOWUP_CHECK_INTERVAL_MS);
 setInterval(runSatisfactionFollowupCheck, FOLLOWUP_CHECK_INTERVAL_MS);
 setInterval(runWeeklyReportCheck, WEEKLY_REPORT_CHECK_INTERVAL_MS);

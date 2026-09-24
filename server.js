@@ -89,7 +89,7 @@ if (!BIZIMHESAP_TOKEN) {
 
 const PRODUCT_FEED_URL = "https://winkelgroup.de/api/products/xml";
 const PRODUCT_FEED_REFRESH_MS = 6 * 60 * 60 * 1000;
-const PRODUCT_IMAGE_MARKER_REGEX = /\[\[PRODUCT_IMAGE:([A-Za-z0-9._-]+)\]\]/;
+const PRODUCT_IMAGE_MARKER_REGEX = /\[\[PRODUCT_IMAGE:([^\]\n]+)\]\]/;
 
 let productCatalog = [];
 let productsWithImages = [];
@@ -323,10 +323,11 @@ async function refreshBizimHesapProducts() {
                     currency: p.currency || "TL",
                     quantity: Number(p.quantity),
                     description: stripHtml(p.ecommerceDescription || p.description || ""),
+                    photoUrl: parseBizimHesapPhoto(p.photo),
                 }));
             bizimhesapLoadedAt = Date.now();
             bizimhesapLastError = null;
-            console.log(`BizimHesap fiyat/stok guncellendi: ${bizimhesapProducts.length} urun.`);
+            console.log(`BizimHesap fiyat/stok guncellendi: ${bizimhesapProducts.length} urun, ${bizimhesapProducts.filter((p) => p.photoUrl).length} tanesinde foto var.`);
         } catch (err) {
             bizimhesapLastError = `${err.response?.status || ""} ${err.message}`.trim();
             console.error("BizimHesap urun listesi alinamadi:", err.response?.status || "", err.response?.data || err.message);
@@ -335,6 +336,21 @@ async function refreshBizimHesapProducts() {
         }
     })();
     return bizimhesapLoading;
+}
+
+// BizimHesap "photo" alanini JSON metni olarak yolluyor:
+// [{"PhotoUrl":"...","PhotoUrlOriginal":"...","FlCover":true}, ...]
+// Kapak fotografini (yoksa ilkini) dondurur.
+function parseBizimHesapPhoto(raw) {
+    try {
+        const list = typeof raw === "string" ? (raw.trim() ? JSON.parse(raw) : []) : raw;
+        if (!Array.isArray(list) || list.length === 0) return null;
+        const cover = list.find((x) => x && (x.FlCover === true || x.FlCover === 1)) || list[0];
+        const url = cover && (cover.PhotoUrl || cover.PhotoUrlOriginal || cover.url);
+        return url && /^https?:\/\//i.test(url) ? toMessagingSafeImageUrl(url) : null;
+    } catch (err) {
+        return null;
+    }
 }
 
 function stripHtml(text) {
@@ -433,11 +449,13 @@ async function buildLivePriceSection(userText, history) {
     if (candidates.length === 0) return "";
 
     const lines = candidates.map((p) => {
-        const code = p.code ? `[${p.code}] ` : "";
+        const id = p.code || p.barcode;
+        const code = id ? `[${id}] ` : "";
         const price = Number.isFinite(p.price) && p.price > 0 ? `Fiyat: ${formatPriceTr(p.price, p.currency)} + KDV` : "Fiyat: sistemde yok";
         const stock = Number.isFinite(p.quantity) ? (p.quantity > 0 ? "Stokta var" : "Stokta yok") : "Stok bilgisi yok";
         const desc = productDescriptionFor(p);
-        return `- ${code}${p.title} — ${price} — ${stock}${desc ? `\n  Açıklama: ${desc}` : ""}`;
+        const photo = p.photoUrl && id ? " — Fotoğraf: var" : "";
+        return `- ${code}${p.title} — ${price} — ${stock}${photo}${desc ? `\n  Açıklama: ${desc}` : ""}`;
     });
 
     return `
@@ -445,7 +463,8 @@ async function buildLivePriceSection(userText, history) {
 CANLI FİYAT, STOK VE ÜRÜN BİLGİSİ (muhasebe sistemimizden az önce çekildi; konuşmayla eşleşen ürünler):
 ${lines.join("\n")}
 
-9. Müşteri fiyat veya stok sorarsa ve sorduğu ürün yukarıdaki CANLI listede varsa, 2. kuraldaki kısıtlama o ürün için GEÇERLİ DEĞİLDİR: fiyatı listede yazdığı gibi "... TL + KDV" şeklinde ver (KDV hariç olduğunu mutlaka belirt, KDV'yi kendin ekleyip hesaplama) ve stok için sadece "stokta var" ya da "stokta yok" de; adet veya miktar ASLA söyleme. Ürünü sunarken yukarıdaki açıklamayı kullan. Ürün kodunu ve adını listede yazdığı gibi, müşterinin istediği özelliklere (kaplama, renk, beden vb.) BİREBİR uyan satırdan al; uyan satır yoksa bunu söyle ve farkı belirterek en yakın seçeneği sor. Birden fazla uygun ürün varsa en fazla 3 tanesini fiyatlarıyla kısaca say ya da hangisini kastettiğini sor. Ürün "Stokta yok" ise bunu nazikçe söyle ve temin süresi için WhatsApp'tan yazabileceğini belirt (bu durumda WhatsApp işaretini ekle). Fiyatı "sistemde yok" olan ya da listede hiç bulunmayan ürünlerde 2. kuraldaki gibi WhatsApp'a yönlendir.`;
+9. Müşteri fiyat veya stok sorarsa ve sorduğu ürün yukarıdaki CANLI listede varsa, 2. kuraldaki kısıtlama o ürün için GEÇERLİ DEĞİLDİR: fiyatı listede yazdığı gibi "... TL + KDV" şeklinde ver (KDV hariç olduğunu mutlaka belirt, KDV'yi kendin ekleyip hesaplama) ve stok için sadece "stokta var" ya da "stokta yok" de; adet veya miktar ASLA söyleme. Ürünü sunarken yukarıdaki açıklamayı kullan. Ürün kodunu ve adını listede yazdığı gibi, müşterinin istediği özelliklere (kaplama, renk, beden vb.) BİREBİR uyan satırdan al; uyan satır yoksa bunu söyle ve farkı belirterek en yakın seçeneği sor. Birden fazla uygun ürün varsa en fazla 3 tanesini fiyatlarıyla kısaca say ya da hangisini kastettiğini sor. Ürün "Stokta yok" ise bunu nazikçe söyle ve temin süresi için WhatsApp'tan yazabileceğini belirt (bu durumda WhatsApp işaretini ekle). Fiyatı "sistemde yok" olan ya da listede hiç bulunmayan ürünlerde 2. kuraldaki gibi WhatsApp'a yönlendir.
+10. Müşteriye belirli bir ürünü sunuyorsan ve o ürünün satırında "Fotoğraf: var" yazıyorsa, cevabının en sonuna (ayrı bir satırda) tam olarak [[PRODUCT_IMAGE:KOD]] ekle; KOD, o satırın başındaki köşeli parantez içindeki koddur. Bir cevapta en fazla bir fotoğraf işareti kullan ve sadece müşterinin istediği özelliklere uyan ürünün fotoğrafını gönder.`;
 }
 
 app.get("/webhook", (req, res) => {
@@ -811,13 +830,25 @@ try {
     let productImageUrl = null;
     const productMatch = cleanText.match(PRODUCT_IMAGE_MARKER_REGEX);
     if (productMatch) {
-        const barcode = productMatch[1];
+        const barcode = productMatch[1].trim();
         const product = productsWithImages.find((p) => p.barcode === barcode);
         if (product && product.images.length > 0) {
             productImageUrl = product.images[0];
             trackAskedProduct(product.title);
+        } else {
+            // Winkel kataloğunda yoksa BizimHesap'taki urun fotografina bak.
+            const wanted = normalizeCode(barcode);
+            const bhProduct = bizimhesapProducts.find(
+                (p) => p.photoUrl && wanted && (normalizeCode(p.code) === wanted || normalizeCode(p.barcode) === wanted)
+            );
+            if (bhProduct) {
+                productImageUrl = bhProduct.photoUrl;
+                trackAskedProduct(bhProduct.title);
+            } else {
+                console.log(`Urun fotografi isareti eslesmedi: ${barcode}`);
+            }
         }
-        cleanText = cleanText.replace(PRODUCT_IMAGE_MARKER_REGEX, "").trim();
+        cleanText = cleanText.replace(new RegExp(PRODUCT_IMAGE_MARKER_REGEX.source, "g"), "").trim();
     } else if (!needsHuman) {
         const fallbackProduct = findProductMentionedInText(userText, cleanText);
         if (fallbackProduct) {

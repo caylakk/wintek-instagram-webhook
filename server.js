@@ -256,6 +256,8 @@ const PRODUCT_MATCH_STOPWORDS = new Set([
 
 function normalizeForMatch(text) {
     return String(text || "")
+        // "3/4" ve "4/3" (kaplama tipi) ayni sey; "/" silinince kaybolmasin diye kelimeye cevir.
+        .replace(/\b(3\s*\/\s*4|4\s*\/\s*3)\b/g, " ucceyrek ")
         .toLocaleLowerCase("tr")
         .replace(/ç/g, "c").replace(/ğ/g, "g").replace(/ı/g, "i")
         .replace(/ö/g, "o").replace(/ş/g, "s").replace(/ü/g, "u")
@@ -437,7 +439,8 @@ function productDescriptionFor(p) {
 // Yapay zekaya verilecek canli fiyat/stok bolumu. Stok ADEDI bilerek hic
 // yazilmiyor - yapay zeka sadece "stokta var / yok" gordugu icin adet sizdiramaz.
 async function buildLivePriceSection(userText, history) {
-    if (!BIZIMHESAP_TOKEN) return "";
+    const empty = { section: "", candidates: [] };
+    if (!BIZIMHESAP_TOKEN) return empty;
     if (bizimhesapProducts.length === 0 || Date.now() - bizimhesapLoadedAt > BIZIMHESAP_REFRESH_MS) {
         await refreshBizimHesapProducts();
     }
@@ -446,7 +449,8 @@ async function buildLivePriceSection(userText, history) {
         ? history.slice(-6).map((m) => (typeof m.content === "string" ? m.content : "")).join(" ")
         : "";
     const candidates = findLivePriceCandidates(userText, contextText);
-    if (candidates.length === 0) return "";
+    if (candidates.length === 0) return empty;
+    console.log(`Canli urun eslesmesi: ${candidates.map((p) => `${p.code || p.barcode || p.title}${p.photoUrl ? " (foto)" : ""}`).join(", ")}`);
 
     const lines = candidates.map((p) => {
         const id = p.code || p.barcode;
@@ -458,13 +462,48 @@ async function buildLivePriceSection(userText, history) {
         return `- ${code}${p.title} — ${price} — ${stock}${photo}${desc ? `\n  Açıklama: ${desc}` : ""}`;
     });
 
-    return `
+    const section = `
 
 CANLI FİYAT, STOK VE ÜRÜN BİLGİSİ (muhasebe sistemimizden az önce çekildi; konuşmayla eşleşen ürünler):
 ${lines.join("\n")}
 
 9. Müşteri fiyat veya stok sorarsa ve sorduğu ürün yukarıdaki CANLI listede varsa, 2. kuraldaki kısıtlama o ürün için GEÇERLİ DEĞİLDİR: fiyatı listede yazdığı gibi "... TL + KDV" şeklinde ver (KDV hariç olduğunu mutlaka belirt, KDV'yi kendin ekleyip hesaplama) ve stok için sadece "stokta var" ya da "stokta yok" de; adet veya miktar ASLA söyleme. Ürünü sunarken yukarıdaki açıklamayı kullan. Ürün kodunu ve adını listede yazdığı gibi, müşterinin istediği özelliklere (kaplama, renk, beden vb.) BİREBİR uyan satırdan al; uyan satır yoksa bunu söyle ve farkı belirterek en yakın seçeneği sor. Birden fazla uygun ürün varsa en fazla 3 tanesini fiyatlarıyla kısaca say ya da hangisini kastettiğini sor. Ürün "Stokta yok" ise bunu nazikçe söyle ve temin süresi için WhatsApp'tan yazabileceğini belirt (bu durumda WhatsApp işaretini ekle). Fiyatı "sistemde yok" olan ya da listede hiç bulunmayan ürünlerde 2. kuraldaki gibi WhatsApp'a yönlendir.
 10. Müşteriye belirli bir ürünü sunuyorsan ve o ürünün satırında "Fotoğraf: var" yazıyorsa, cevabının en sonuna (ayrı bir satırda) tam olarak [[PRODUCT_IMAGE:KOD]] ekle; KOD, o satırın başındaki köşeli parantez içindeki koddur. Bir cevapta en fazla bir fotoğraf işareti kullan ve sadece müşterinin istediği özelliklere uyan ürünün fotoğrafını gönder.`;
+    return { section, candidates };
+}
+
+// Yapay zeka fotograf isaretini koymayi unutursa: botun cevabinda adi/kodu gecen
+// ve fotografi olan canli urunu bulur. Sadece tek bir urun acikca one cikiyorsa
+// dondurur (yanlis urunun fotografini atmamak icin).
+function findLiveProductInReply(candidates, replyText) {
+    const withPhoto = (candidates || []).filter((p) => p.photoUrl);
+    if (withPhoto.length === 0 || !replyText) return null;
+
+    const replyNorm = normalizeCode(replyText);
+    const byCode = withPhoto.filter((p) => {
+        const c = normalizeCode(p.code || p.barcode);
+        return c.length >= 4 && replyNorm.includes(c);
+    });
+    if (byCode.length === 1) return byCode[0];
+
+    const replyStems = matchStems(replyText, LIVE_STEM_LENGTH);
+    const scored = withPhoto
+        .map((p) => {
+            const ts = [...matchStems(p.title, LIVE_STEM_LENGTH)];
+            const hits = ts.filter((s) => replyStems.has(s)).length;
+            const hitSet = new Set(ts.filter((s) => replyStems.has(s)));
+            return { p, hits: hitSet.size, hitSet, ratio: ts.length ? hitSet.size / ts.length : 0 };
+        })
+        .filter((x) => x.hits >= 2 && x.ratio >= 0.6)
+        .sort((a, b) => b.ratio - a.ratio || b.hits - a.hits);
+    if (scored.length === 0) return null;
+    // Birden fazla aday varsa, en iyisinin cevapta digerinde olmayan ayirt edici bir
+    // kelimesi (orn. "tam", "ucceyrek", renk, beden) olmali; yoksa hangisi oldugu belli degil.
+    if (scored.length > 1) {
+        const distinct = [...scored[0].hitSet].some((s) => !scored[1].hitSet.has(s));
+        if (!distinct) return null;
+    }
+    return scored[0].p;
 }
 
 app.get("/webhook", (req, res) => {
@@ -797,9 +836,9 @@ const history = await getHistory(historyKey);
     const messages = [...history.map((m) => ({ role: m.role, content: m.content })), { role: "user", content: userText }];
 
 try {
-    let liveSection = "";
+    let live = { section: "", candidates: [] };
     try {
-        liveSection = await buildLivePriceSection(userText, history);
+        live = await buildLivePriceSection(userText, history);
     } catch (err) {
         console.error("Canli fiyat/stok bolumu olusturulamadi:", err.message);
     }
@@ -807,7 +846,7 @@ try {
     const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: maxTokens,
-        system: `${buildSystemPrompt(liveSection)}${buildChannelSection(historyKey)}`,
+        system: `${buildSystemPrompt(live.section)}${buildChannelSection(historyKey)}`,
         messages,
     });
 
@@ -855,6 +894,31 @@ try {
             productImageUrl = fallbackProduct.images[0];
             trackAskedProduct(fallbackProduct.title);
             console.log(`Urun fotografi yedek eslestirmeyle bulundu: ${fallbackProduct.title} (${fallbackProduct.barcode})`);
+        }
+    }
+
+    if (!productImageUrl) {
+        const liveProduct = findLiveProductInReply(live.candidates, cleanText);
+        if (liveProduct) {
+            productImageUrl = liveProduct.photoUrl;
+            trackAskedProduct(liveProduct.title);
+            console.log(`Urun fotografi cevaptaki urunden bulundu: ${liveProduct.title}`);
+        }
+    }
+
+    // Ayni konusmada ayni fotografi her mesajda tekrar gonderme ("12 adet" gibi
+    // devam mesajlarinda bot urunu tekrar anabilir).
+    if (productImageUrl && redis) {
+        try {
+            const lastKey = `lastphoto:${historyKey}`;
+            const last = await redis.get(lastKey);
+            if (last === productImageUrl) {
+                productImageUrl = null;
+            } else {
+                await redis.set(lastKey, productImageUrl, { ex: 24 * 60 * 60 });
+            }
+        } catch (err) {
+            console.error("Son fotograf kontrolu hatasi:", err.message);
         }
     }
 
@@ -2909,7 +2973,7 @@ app.get("/admin/bizimhesap-check", async (req, res) => {
     }
     await refreshBizimHesapProducts();
     const q = String(req.query.q || "");
-    const section = q ? await buildLivePriceSection(q, []) : "";
+    const section = q ? (await buildLivePriceSection(q, [])).section : "";
     const lines = [
         `Cekilen urun sayisi: ${bizimhesapProducts.length}`,
         `Son guncelleme: ${bizimhesapLoadedAt ? new Date(bizimhesapLoadedAt).toISOString() : "henuz yok"}`,

@@ -200,9 +200,61 @@ function buildSystemPrompt() {
 FOTOĞRAFI MEVCUT ÜRÜNLER (sadece bu listedeki ürünler için fotoğraf paylaşabilirsin):
 ${lines}
 
-8. Müşteri yukarıdaki listede bulunan bir ürünü özellikle soruyorsa ve hangi ürünü kastettiğinden eminsen, cevabının en sonuna (varsa WhatsApp/insan devri işaretlerinden sonra, ayrı bir satırda) tam olarak şu formatta ekle: [[PRODUCT_IMAGE:BARKOD]] — BARKOD yerine yukarıdaki listeden ilgili ürünün gerçek barkodunu yaz. Listede olmayan ya da hangi ürün olduğundan emin olmadığın durumlarda bu işareti KESİNLİKLE kullanma; bu durumda elinde o ürünün fotoğrafı olmadığını söyleyip normal şekilde yardımcı ol.`;
+8. Müşteri yukarıdaki listede bulunan bir ürünü soruyorsa ya da adını yazıyorsa, cevabının en sonuna (varsa WhatsApp/insan devri işaretlerinden sonra, ayrı bir satırda) tam olarak şu formatta ekle: [[PRODUCT_IMAGE:BARKOD]] — BARKOD yerine yukarıdaki listeden ilgili ürünün gerçek barkodunu yaz. Müşteri ürün adını birebir yazmak zorunda değil: yakın ya da kısmi bir ad yazdıysa (örn. "fren balata temizleyici" → "Fren Balata Temizleme Sprey") ve listede buna açıkça karşılık gelen TEK bir ürün varsa, o ürünün barkoduyla işareti ekle. Listede karşılığı olmayan ya da birden fazla ürünün aynı ölçüde uyduğu durumlarda bu işareti kullanma; bu durumda elinde o ürünün fotoğrafı olmadığını söyleyip normal şekilde yardımcı ol.`;
 
     return `${BASE_SYSTEM_PROMPT}${catalogSection}`;
+}
+
+// Yapay zeka [[PRODUCT_IMAGE:...]] isaretini koymayi unuttugunda devreye giren
+// yedek eslestirme. Musterinin mesajindaki kelimeleri urun adlariyla karsilastirir;
+// SADECE tek bir urun acikca one cikiyorsa VE botun cevabi da o urunden
+// bahsediyorsa o urunu dondurur - yanlis urunun fotografini atmamak icin temkinli.
+const PRODUCT_MATCH_STOPWORDS = new Set([
+    "icin", "ile", "var", "mi", "mu", "ne", "kadar", "fiyat", "fiyati", "fiyatlari",
+    "urun", "urunu", "urunler", "bilgi", "bilgisi", "alabilir", "miyim", "stok", "stokta",
+    "stogunuzda", "hakkinda", "bir", "bu", "su", "ve", "veya", "da", "de", "sprey",
+    "spreyi", "merhaba", "selam", "istiyorum", "lazim", "arıyorum", "ariyorum", "fotograf",
+]);
+
+function normalizeForMatch(text) {
+    return String(text || "")
+        .toLocaleLowerCase("tr")
+        .replace(/ç/g, "c").replace(/ğ/g, "g").replace(/ı/g, "i")
+        .replace(/ö/g, "o").replace(/ş/g, "s").replace(/ü/g, "u")
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim();
+}
+
+// Turkce ekleri kabaca yok saymak icin her kelimenin ilk 5 harfini kok gibi kullanir
+// ("temizleyici" / "temizleme" -> "temiz", "balatasi" -> "balat").
+function matchStems(text) {
+    return new Set(
+        normalizeForMatch(text)
+            .split(" ")
+            .filter((w) => w.length >= 3 && !PRODUCT_MATCH_STOPWORDS.has(w))
+            .map((w) => w.slice(0, 5))
+    );
+}
+
+function findProductMentionedInText(userText, replyText) {
+    const queryStems = matchStems(userText);
+    if (queryStems.size === 0) return null;
+    const replyStems = matchStems(replyText);
+
+    const scored = productsWithImages
+        .map((p) => {
+            const titleStems = [...matchStems(p.title)];
+            const hits = titleStems.filter((s) => queryStems.has(s));
+            return { product: p, hits, titleCount: titleStems.length };
+        })
+        .filter((x) => x.hits.length >= 2 && x.hits.length >= Math.ceil(x.titleCount / 2))
+        .sort((a, b) => b.hits.length - a.hits.length);
+
+    if (scored.length === 0) return null;
+    const best = scored[0];
+    if (scored.length > 1 && scored[1].hits.length === best.hits.length) return null;
+    if (!best.hits.some((s) => replyStems.has(s))) return null;
+    return best.product;
 }
 
 app.get("/webhook", (req, res) => {
@@ -568,6 +620,13 @@ try {
             trackAskedProduct(product.title);
         }
         cleanText = cleanText.replace(PRODUCT_IMAGE_MARKER_REGEX, "").trim();
+    } else if (!needsHuman) {
+        const fallbackProduct = findProductMentionedInText(userText, cleanText);
+        if (fallbackProduct) {
+            productImageUrl = fallbackProduct.images[0];
+            trackAskedProduct(fallbackProduct.title);
+            console.log(`Urun fotografi yedek eslestirmeyle bulundu: ${fallbackProduct.title} (${fallbackProduct.barcode})`);
+        }
     }
 
     const finalText = cleanText || FALLBACK_REPLY;

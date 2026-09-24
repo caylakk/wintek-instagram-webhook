@@ -77,7 +77,7 @@ const BIZIMHESAP_TOKEN = process.env.BIZIMHESAP_TOKEN || process.env.STOCK_API_K
 const BIZIMHESAP_PRODUCTS_URL = "https://bizimhesap.com/api/b2b/products";
 const BIZIMHESAP_PUBLIC_KEY = "BZMHB2B724018943908D0B82491F203F";
 const BIZIMHESAP_REFRESH_MS = 15 * 60 * 1000;
-const LIVE_PRICE_MAX_CANDIDATES = 6;
+const LIVE_PRICE_MAX_CANDIDATES = 10;
 let bizimhesapProducts = [];
 let bizimhesapLoadedAt = 0;
 let bizimhesapLoading = null;
@@ -183,7 +183,7 @@ const WELCOME_BUTTONS_SECONDARY = [
 ];
 const WELCOME_BUTTONS_SECONDARY_TEXT = "Başka bir konu mu var?";
 
-const BASE_SYSTEM_PROMPT = `Sen Wintek'in Instagram hesabı için çalışan bir müşteri asistanısın. Türkçe, samimi, kısa ve net cevaplar veriyorsun.
+const BASE_SYSTEM_PROMPT = `Sen Wintek'in Instagram ve WhatsApp hesapları için çalışan bir müşteri temsilcisi ve satış danışmanısın. Türkçe, samimi, kısa ve net cevaplar veriyorsun.
 
 WINTEK NE SATAR:
 - İş güvenliği ve el aletleri: iş eldivenleri, matkap uçları, sanayi için (demonte) çalışma tezgahları, akülü el aletleri ve benzeri endüstriyel ürünler.
@@ -199,10 +199,30 @@ KURALLAR:
 1. Ürünler, kullanım alanları ve genel bilgilerle ilgili sorulara elinden geldiğince net ve yardımcı şekilde cevap ver.
 2. STOK DURUMU veya KESİN FİYAT sorulduğunda: canlı stok/fiyat sistemine erişimin olmadığını unutma, bu yüzden kesin rakam veya "stokta var/yok" bilgisi UYDURMA. Bu durumlarda nazikçe kesin teyit için WhatsApp'tan iletişime geçmeyi öner (cevabında "WhatsApp'tan yazabilirsiniz" gibi bir ifade kullanabilirsin ama telefon numarasını asla yazma). Bu durumda, cevabının en sonuna başka hiçbir şey eklemeden tam olarak şu işareti ekle: ${WHATSAPP_BUTTON_MARKER}
 3. Alakasız, uygunsuz ya da Wintek'in işiyle ilgisi olmayan taleplerde kibarca konuyu Wintek'in ürün/hizmetlerine getir ya da gerekiyorsa yukarıdaki WhatsApp yönlendirmesini (2. kuraldaki gibi) kullan.
-4. Yanıtların Instagram DM/yorum ortamına uygun olsun: kısa (1-4 cümle), gereksiz uzatmadan, doğal bir müşteri temsilcisi tonunda. Emoji kullanımı ölçülü olsun, abartma.
+4. Yanıtların mesajlaşma ortamına uygun olsun: kısa (genelde 2-4 cümle, bir ürünü tanıtırken en fazla 6 cümle), gereksiz uzatmadan, doğal bir müşteri temsilcisi tonunda. Emoji kullanımı ölçülü olsun, abartma.
 5. Kendini yapay zeka olarak tanıtmana gerek yok, Wintek adına yazan doğal bir temsilci gibi davran.
 6. Konuşmanın başında müşteriye otomatik bir karşılama mesajı zaten gönderiliyor. Bu yüzden sen ayrıca "hoş geldiniz", "merhaba" gibi bir karşılama cümlesiyle başlama; doğrudan müşterinin sorusuna veya talebine odaklan.
-7. Eğer müşteri açıkça gerçek bir yetkili/insanla görüşmek istediğini belirtirse (örneğin: "gerçek biriyle konuşmak istiyorum", "bir yetkiliye bağlar mısınız", "insanla görüşebilir miyim", "müşteri temsilcisi istiyorum" gibi), onu nazikçe yönlendiren kısa bir cevap ver (örn: "Elbette, ekibimizden biri en kısa sürede sizinle ilgilenecek.") ve cevabının en sonuna başka hiçbir şey eklemeden tam olarak şu işareti ekle: ${HUMAN_HANDOFF_MARKER}`;
+7. Eğer müşteri açıkça gerçek bir yetkili/insanla görüşmek istediğini belirtirse (örneğin: "gerçek biriyle konuşmak istiyorum", "bir yetkiliye bağlar mısınız", "insanla görüşebilir miyim", "müşteri temsilcisi istiyorum" gibi), onu nazikçe yönlendiren kısa bir cevap ver (örn: "Elbette, ekibimizden biri en kısa sürede sizinle ilgilenecek.") ve cevabının en sonuna başka hiçbir şey eklemeden tam olarak şu işareti ekle: ${HUMAN_HANDOFF_MARKER}
+
+SATIŞ YAKLAŞIMI:
+- Bir ürünü sunarken sadece özellik sayma; müşterinin işine nasıl yarayacağını (faydasını, hangi işte kullanılacağını) 1-2 cümleyle anlat. Bunu yalnızca sana verilen ürün adı ve açıklamasındaki GERÇEK bilgilere dayanarak yap; açıklamada olmayan teknik değer, sertifika ya da özellik UYDURMA.
+- Müşterinin istediği özelliklere (kaplama tipi, renk, beden, ölçü, miktar gibi) BİREBİR uyan ürünü seç. Örneğin müşteri "tam kaplı" istiyorsa 3/4 kaplı ürünü önerme. Birebir uyan ürün yoksa bunu açıkça söyle, en yakın seçeneği farkını belirterek sun ve müşteriye sor; farklı bir ürünü istenen ürünmüş gibi sunma.
+- İhtiyacı netleştirmek gerekiyorsa kısa bir soru sor (kullanım alanı, beden, adet gibi).
+- Uygun olduğunda tamamlayıcı bir ürün önerebilirsin ama sadece gerçekten sattığımız ürünlerden, tek cümleyle ve ısrarcı olmadan.
+- Cevabını mümkünse müşteriyi bir sonraki adıma taşıyan bir soruyla bitir (örn. "Kaç adet düşünüyorsunuz?", "Siparişinizi hazırlayalım mı?").
+- Sahte aciliyet ("son 2 tane kaldı", "kampanya bugün bitiyor" gibi) ve baskıcı satış dili KESİNLİKLE kullanma.
+- Müşteri satın almak ya da sipariş vermek istediğini söylerse ürünü, adedi ve (varsa) beden/renk bilgisini kısaca teyit et, "Siparişinizi ekibimize iletiyorum, en kısa sürede sizinle iletişime geçecekler." de ve cevabının en sonuna insan devri işaretini (${HUMAN_HANDOFF_MARKER}) ekle.`;
+
+// Konusmanin hangi kanaldan geldigine gore eklenen kural. WhatsApp'ta musteri
+// zaten bizimle WhatsApp'tan yazistigi icin "WhatsApp'tan yazin" demek anlamsiz.
+function buildChannelSection(historyKey) {
+    if (String(historyKey || "").startsWith("conv:whatsapp:")) {
+        return `
+
+KANAL: Bu konuşma WhatsApp üzerinden yapılıyor, müşteri zaten bizimle WhatsApp'ta yazışıyor. Bu yüzden ASLA "WhatsApp'tan yazın/ulaşın" deme ve WhatsApp işaretini (${WHATSAPP_BUTTON_MARKER}) KULLANMA. Yukarıdaki kurallarda WhatsApp'a yönlendirmen söylenen her durumda bunun yerine "Ekibimiz size bu numaradan en kısa sürede dönüş yapacak." de ve cevabının en sonuna insan devri işaretini (${HUMAN_HANDOFF_MARKER}) ekle.`;
+    }
+    return "";
+}
 
 function buildSystemPrompt(liveSection = "") {
     if (productsWithImages.length === 0) {
@@ -245,12 +265,12 @@ function normalizeForMatch(text) {
 
 // Turkce ekleri kabaca yok saymak icin her kelimenin ilk 5 harfini kok gibi kullanir
 // ("temizleyici" / "temizleme" -> "temiz", "balatasi" -> "balat").
-function matchStems(text) {
+function matchStems(text, stemLength = 5) {
     return new Set(
         normalizeForMatch(text)
             .split(" ")
             .filter((w) => w.length >= 3 && !PRODUCT_MATCH_STOPWORDS.has(w))
-            .map((w) => w.slice(0, 5))
+            .map((w) => w.slice(0, stemLength))
     );
 }
 
@@ -302,6 +322,7 @@ async function refreshBizimHesapProducts() {
                     price: Number(p.variantPrice || p.price),
                     currency: p.currency || "TL",
                     quantity: Number(p.quantity),
+                    description: stripHtml(p.ecommerceDescription || p.description || ""),
                 }));
             bizimhesapLoadedAt = Date.now();
             bizimhesapLastError = null;
@@ -314,6 +335,16 @@ async function refreshBizimHesapProducts() {
         }
     })();
     return bizimhesapLoading;
+}
+
+function stripHtml(text) {
+    return String(text || "")
+        .replace(/<[^>]*>/g, " ")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&[a-z]+;/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
 function normalizeCode(code) {
@@ -331,36 +362,60 @@ function formatPriceTr(price, currency) {
     return `${price.toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${cur}`;
 }
 
-// Musterinin mesajiyla eslesen BizimHesap urunlerini bulur: once artikel numarasi
-// (W170112 gibi; winkelgroup.de feed'inde isimle bulunan urunlerin barkodu da
-// buraya eklenir), sonra urun adindaki kelimeler (Faba eldiven, Wintek eldiven...).
-function findLivePriceCandidates(text) {
+// Musterinin mesajiyla eslesen BizimHesap urunlerini bulur. Puanlama:
+// - Artikel numarasi (W170112 gibi) eslesmesi en guclu sinyal.
+// - Son mesajdaki kelimeler 2 puan, konusmanin onceki mesajlarindaki kelimeler
+//   1 puan. Boylece "Faba eldiven var mi?" -> "Tam kapli siyah istiyorum" gibi
+//   devam mesajlarinda dogru urun one cikar.
+// Kelimeler ilk 4 harfiyle karsilastirilir ("kapli" / "kaplama" -> "kapl").
+const LIVE_STEM_LENGTH = 4;
+
+function findLivePriceCandidates(text, contextText = "") {
     if (bizimhesapProducts.length === 0) return [];
 
-    const codes = extractArticleCodes(text);
-    const queryStems = matchStems(text);
+    const currentStems = matchStems(text, LIVE_STEM_LENGTH);
+    const contextStems = matchStems(contextText, LIVE_STEM_LENGTH);
+
+    const codes = extractArticleCodes(`${text} ${contextText}`);
+    const currentCodes = extractArticleCodes(text);
     for (const p of productCatalog) {
-        const hits = [...matchStems(p.title)].filter((s) => queryStems.has(s));
-        if (hits.length >= 2) codes.add(normalizeCode(p.barcode));
+        const hits = [...matchStems(p.title, LIVE_STEM_LENGTH)].filter((s) => currentStems.has(s));
+        if (hits.length >= 2) currentCodes.add(normalizeCode(p.barcode));
     }
 
-    const byCode = bizimhesapProducts.filter(
-        (p) => codes.has(normalizeCode(p.code)) || codes.has(normalizeCode(p.barcode))
+    const scored = bizimhesapProducts
+        .map((p) => {
+            const titleStems = [...matchStems(p.title, LIVE_STEM_LENGTH)];
+            const cur = titleStems.filter((s) => currentStems.has(s)).length;
+            const ctx = titleStems.filter((s) => contextStems.has(s) && !currentStems.has(s)).length;
+            const pc = normalizeCode(p.code);
+            const pb = normalizeCode(p.barcode);
+            let score = cur * 2 + ctx;
+            if (currentCodes.has(pc) || currentCodes.has(pb)) score += 100;
+            else if (codes.has(pc) || codes.has(pb)) score += 50;
+            return { p, score, cur };
+        })
+        .filter((x) => x.score >= 2)
+        .sort((a, b) => b.score - a.score);
+
+    if (scored.length === 0) return [];
+    // En iyi puanin yarisindan dusuk olanlar alakasiz sayilir.
+    const minScore = Math.max(2, Math.ceil(scored[0].score / 2));
+    return scored
+        .filter((x) => x.score >= minScore)
+        .slice(0, LIVE_PRICE_MAX_CANDIDATES)
+        .map((x) => x.p);
+}
+
+function productDescriptionFor(p) {
+    const feed = productCatalog.find(
+        (f) => normalizeCode(f.barcode) && (normalizeCode(f.barcode) === normalizeCode(p.code) || normalizeCode(f.barcode) === normalizeCode(p.barcode))
     );
-
-    const byName = queryStems.size === 0 ? [] : bizimhesapProducts
-        .map((p) => ({ p, hits: [...matchStems(p.title)].filter((s) => queryStems.has(s)).length }))
-        .filter((x) => x.hits >= 1)
-        .sort((a, b) => b.hits - a.hits);
-    const bestHits = byName.length > 0 ? byName[0].hits : 0;
-    const nameMatches = byName.filter((x) => x.hits === bestHits).map((x) => x.p);
-
-    const result = [];
-    for (const p of [...byCode, ...nameMatches]) {
-        if (!result.includes(p)) result.push(p);
-        if (result.length >= LIVE_PRICE_MAX_CANDIDATES) break;
-    }
-    return result;
+    const text = [p.description, feed ? stripHtml(feed.description) : ""]
+        .filter(Boolean)
+        .filter((t, i, arr) => arr.indexOf(t) === i)
+        .join(" ");
+    return text.length > 600 ? `${text.slice(0, 600)}...` : text;
 }
 
 // Yapay zekaya verilecek canli fiyat/stok bolumu. Stok ADEDI bilerek hic
@@ -371,28 +426,26 @@ async function buildLivePriceSection(userText, history) {
         await refreshBizimHesapProducts();
     }
 
-    // Once sadece son mesaja bak; eslesme yoksa ("stokta var mi?" gibi devam
-    // sorulari) konusmanin son birkac mesajindaki urun adlarina bak.
-    let candidates = findLivePriceCandidates(userText);
-    if (candidates.length === 0 && Array.isArray(history)) {
-        const recent = history.slice(-4).map((m) => (typeof m.content === "string" ? m.content : "")).join(" ");
-        candidates = findLivePriceCandidates(recent);
-    }
+    const contextText = Array.isArray(history)
+        ? history.slice(-6).map((m) => (typeof m.content === "string" ? m.content : "")).join(" ")
+        : "";
+    const candidates = findLivePriceCandidates(userText, contextText);
     if (candidates.length === 0) return "";
 
     const lines = candidates.map((p) => {
         const code = p.code ? `[${p.code}] ` : "";
         const price = Number.isFinite(p.price) && p.price > 0 ? `Fiyat: ${formatPriceTr(p.price, p.currency)} + KDV` : "Fiyat: sistemde yok";
         const stock = Number.isFinite(p.quantity) ? (p.quantity > 0 ? "Stokta var" : "Stokta yok") : "Stok bilgisi yok";
-        return `- ${code}${p.title} — ${price} — ${stock}`;
+        const desc = productDescriptionFor(p);
+        return `- ${code}${p.title} — ${price} — ${stock}${desc ? `\n  Açıklama: ${desc}` : ""}`;
     });
 
     return `
 
-CANLI FİYAT VE STOK BİLGİSİ (muhasebe sistemimizden az önce çekildi; müşterinin mesajıyla eşleşen ürünler):
+CANLI FİYAT, STOK VE ÜRÜN BİLGİSİ (muhasebe sistemimizden az önce çekildi; konuşmayla eşleşen ürünler):
 ${lines.join("\n")}
 
-9. Müşteri fiyat veya stok sorarsa ve sorduğu ürün yukarıdaki CANLI listede varsa, 2. kuraldaki kısıtlama o ürün için GEÇERLİ DEĞİLDİR: fiyatı listede yazdığı gibi "... TL + KDV" şeklinde ver (KDV hariç olduğunu mutlaka belirt, KDV'yi kendin ekleyip hesaplama) ve stok için sadece "stokta var" ya da "stokta yok" de; adet veya miktar ASLA söyleme. Listede sorulana benzeyen birden fazla ürün varsa en fazla 3 tanesini fiyatlarıyla kısaca say ya da hangisini kastettiğini sor. Ürün "Stokta yok" ise bunu nazikçe söyle ve temin süresi için WhatsApp'tan yazabileceğini belirt (bu durumda WhatsApp işaretini ekle). Fiyatı "sistemde yok" olan ya da listede hiç bulunmayan ürünlerde 2. kuraldaki gibi WhatsApp'a yönlendir.`;
+9. Müşteri fiyat veya stok sorarsa ve sorduğu ürün yukarıdaki CANLI listede varsa, 2. kuraldaki kısıtlama o ürün için GEÇERLİ DEĞİLDİR: fiyatı listede yazdığı gibi "... TL + KDV" şeklinde ver (KDV hariç olduğunu mutlaka belirt, KDV'yi kendin ekleyip hesaplama) ve stok için sadece "stokta var" ya da "stokta yok" de; adet veya miktar ASLA söyleme. Ürünü sunarken yukarıdaki açıklamayı kullan. Ürün kodunu ve adını listede yazdığı gibi, müşterinin istediği özelliklere (kaplama, renk, beden vb.) BİREBİR uyan satırdan al; uyan satır yoksa bunu söyle ve farkı belirterek en yakın seçeneği sor. Birden fazla uygun ürün varsa en fazla 3 tanesini fiyatlarıyla kısaca say ya da hangisini kastettiğini sor. Ürün "Stokta yok" ise bunu nazikçe söyle ve temin süresi için WhatsApp'tan yazabileceğini belirt (bu durumda WhatsApp işaretini ekle). Fiyatı "sistemde yok" olan ya da listede hiç bulunmayan ürünlerde 2. kuraldaki gibi WhatsApp'a yönlendir.`;
 }
 
 app.get("/webhook", (req, res) => {
@@ -735,7 +788,7 @@ try {
     const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: maxTokens,
-        system: buildSystemPrompt(liveSection),
+        system: `${buildSystemPrompt(liveSection)}${buildChannelSection(historyKey)}`,
         messages,
     });
 

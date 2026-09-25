@@ -6,6 +6,8 @@ const { Redis } = require("@upstash/redis");
 
 const app = express();
 app.use(express.json());
+// WhatsApp profil sayfasi fotografi base64 gonderdigi icin o adreste sinir daha yuksek.
+app.use("/admin/wa-profil", express.urlencoded({ extended: true, limit: "8mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 const {
@@ -3339,6 +3341,151 @@ app.get("/admin/bizimhesap-check", async (req, res) => {
         q ? `"${q}" icin yapay zekaya gidecek bilgi:${section || "\n(eslesen urun yok)"}` : "Deneme icin adrese &q=faba eldiven gibi bir mesaj ekleyin.",
     ];
     res.type("text/plain; charset=utf-8").send(lines.join("\n"));
+});
+
+// --- WhatsApp isletme profili (Hakkinda, aciklama, adres, foto) ---------------
+// WhatsApp Yoneticisi ekrani kaydetmeyi sebep gostermeden reddedince profili
+// dogrudan Cloud API ile guncellemek icin. Meta'nin hata mesaji aynen gosterilir.
+const WA_PROFILE_FIELDS = "about,address,description,email,profile_picture_url,websites,vertical";
+const WA_VERTICALS = ["AUTO", "RETAIL", "OTHER", "PROF_SERVICES", "UNDEFINED"];
+
+async function getWhatsAppBusinessProfile() {
+    const url = `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/whatsapp_business_profile`;
+    const { data } = await axios.get(url, {
+        params: { fields: WA_PROFILE_FIELDS },
+        headers: { Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}` },
+        timeout: 20000,
+    });
+    return (data && data.data && data.data[0]) || {};
+}
+
+// Meta'nin "resumable upload" akisi: once oturum ac, sonra dosyayi yukle, donen
+// handle'i profil guncellemesinde profile_picture_handle olarak kullan.
+async function uploadWhatsAppProfilePhoto(buffer, mimeType) {
+    const appId = process.env.META_APP_ID || "app";
+    const base = `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}`;
+    const session = await axios.post(`${base}/${appId}/uploads`, null, {
+        params: { file_length: buffer.length, file_type: mimeType, access_token: WHATSAPP_ACCESS_TOKEN },
+        timeout: 20000,
+    });
+    const sessionId = session.data && session.data.id;
+    if (!sessionId) throw new Error("Yukleme oturumu acilamadi: " + JSON.stringify(session.data));
+    const upload = await axios.post(`${base}/${sessionId}`, buffer, {
+        headers: { Authorization: `OAuth ${WHATSAPP_ACCESS_TOKEN}`, file_offset: "0", "Content-Type": mimeType },
+        maxBodyLength: Infinity,
+        timeout: 30000,
+    });
+    const handle = upload.data && upload.data.h;
+    if (!handle) throw new Error("Foto yuklendi ama handle donmedi: " + JSON.stringify(upload.data));
+    return handle;
+}
+
+function metaErrorText(err) {
+    const e = err.response?.data?.error;
+    if (e) return `${e.message || "Hata"}${e.error_user_msg ? " - " + e.error_user_msg : ""} (kod ${e.code}${e.error_subcode ? "/" + e.error_subcode : ""})`;
+    return err.message;
+}
+
+function renderWaProfilePage(profile, message, isError, key) {
+    const p = profile || {};
+    const sites = Array.isArray(p.websites) ? p.websites : [];
+    const opt = (v) => `<option value="${v}"${(p.vertical || "AUTO") === v ? " selected" : ""}>${v}</option>`;
+    return `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WhatsApp Profili - Wintek</title>
+<style>${FORM_PAGE_STYLE} .msg{padding:12px;border-radius:6px;margin:16px 0;white-space:pre-wrap} .ok{background:#e8f5e9;color:#1b5e20} .err{background:#ffebee;color:#b71c1c} .cnt{font-weight:normal;color:#888;font-size:.85em} .pic{display:block;width:120px;height:120px;border-radius:50%;object-fit:cover;border:1px solid #ddd;margin:8px 0}</style>
+</head><body>
+<h1>WhatsApp İşletme Profili</h1>
+<p class="intro">0272 216 48 48 numarasının profilini doğrudan WhatsApp'a gönderir.</p>
+${message ? `<div class="msg ${isError ? "err" : "ok"}">${escapeHtml(message)}</div>` : ""}
+<form id="f" method="POST" action="/admin/wa-profil">
+<input type="hidden" name="key" value="${escapeHtml(key)}">
+<input type="hidden" name="photoBase64" id="photoBase64">
+<label>Profil fotoğrafı</label>
+${p.profile_picture_url ? `<img class="pic" src="${escapeHtml(p.profile_picture_url)}" alt="">` : "<p>Şu an fotoğraf yok.</p>"}
+<input type="file" id="photo" accept="image/*">
+<img class="pic" id="preview" style="display:none" alt="">
+<label for="about">Hakkında <span class="cnt">(en fazla 139)</span></label>
+<input type="text" name="about" id="about" maxlength="139" value="${escapeHtml(p.about || "")}">
+<label for="description">Açıklama <span class="cnt">(en fazla 512)</span></label>
+<textarea name="description" id="description" maxlength="512" style="min-height:200px">${escapeHtml(p.description || "")}</textarea>
+<label for="vertical">Kategori</label>
+<select name="vertical" id="vertical">${WA_VERTICALS.map(opt).join("")}</select>
+<label for="address">Adres</label>
+<input type="text" name="address" id="address" maxlength="256" value="${escapeHtml(p.address || "")}">
+<label for="email">E-posta</label>
+<input type="email" name="email" id="email" maxlength="128" value="${escapeHtml(p.email || "")}">
+<label for="website1">Web sitesi</label>
+<input type="text" name="website1" id="website1" maxlength="256" value="${escapeHtml(sites[0] || "")}">
+<label for="website2">Web sitesi 2</label>
+<input type="text" name="website2" id="website2" maxlength="256" value="${escapeHtml(sites[1] || "")}">
+<button type="submit">WhatsApp'a Kaydet</button>
+</form>
+<script>
+// Secilen fotografi 640x640 beyaz zeminli kareye oturtup JPEG olarak gonderir.
+document.getElementById("photo").addEventListener("change", function () {
+  var file = this.files && this.files[0]; if (!file) return;
+  var img = new Image();
+  img.onload = function () {
+    var S = 640, c = document.createElement("canvas"); c.width = S; c.height = S;
+    var x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, S, S);
+    var r = Math.min(S * 0.9 / img.width, S * 0.9 / img.height), w = img.width * r, h = img.height * r;
+    x.drawImage(img, (S - w) / 2, (S - h) / 2, w, h);
+    var d = c.toDataURL("image/jpeg", 0.9);
+    document.getElementById("photoBase64").value = d.split(",")[1];
+    var pv = document.getElementById("preview"); pv.src = d; pv.style.display = "block";
+  };
+  img.src = URL.createObjectURL(file);
+});
+</script>
+</body></html>`;
+}
+
+app.get("/admin/wa-profil", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    res.set("Content-Type", "text/html; charset=utf-8");
+    try {
+        res.send(renderWaProfilePage(await getWhatsAppBusinessProfile(), "", false, req.query.key));
+    } catch (err) {
+        res.send(renderWaProfilePage({}, "Profil okunamadı: " + metaErrorText(err), true, req.query.key));
+    }
+});
+
+app.post("/admin/wa-profil", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    res.set("Content-Type", "text/html; charset=utf-8");
+    const b = req.body || {};
+    const body = {
+        messaging_product: "whatsapp",
+        about: clean(b.about, 139),
+        description: clean(b.description, 512),
+        address: clean(b.address, 256),
+        email: clean(b.email, 128),
+        vertical: WA_VERTICALS.includes(b.vertical) ? b.vertical : "AUTO",
+        websites: [clean(b.website1, 256), clean(b.website2, 256)].filter(Boolean),
+    };
+    // Bos alanlari gondermiyoruz (Meta bos e-posta/web sitesini gecersiz sayabiliyor).
+    for (const k of ["about", "description", "address", "email"]) if (!body[k]) delete body[k];
+    if (!body.websites.length) delete body.websites;
+    const steps = [];
+    try {
+        if (b.photoBase64) {
+            const buffer = Buffer.from(String(b.photoBase64), "base64");
+            body.profile_picture_handle = await uploadWhatsAppProfilePhoto(buffer, "image/jpeg");
+            steps.push(`Fotoğraf yüklendi (${Math.round(buffer.length / 1024)} KB).`);
+        }
+        const url = `https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/whatsapp_business_profile`;
+        await axios.post(url, body, { headers: { Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}` }, timeout: 20000 });
+        steps.push("Profil WhatsApp'a kaydedildi ✅ (telefonlarda görünmesi birkaç dakika sürebilir).");
+        console.log("WhatsApp profili guncellendi.");
+        let profile = {};
+        try { profile = await getWhatsAppBusinessProfile(); } catch (_) { profile = { ...body, websites: body.websites }; }
+        res.send(renderWaProfilePage(profile, steps.join("\n"), false, b.key));
+    } catch (err) {
+        const msg = metaErrorText(err);
+        console.error("WhatsApp profili guncellenemedi:", err.response?.data || err.message);
+        steps.push("Kaydedilemedi: " + msg);
+        res.send(renderWaProfilePage({ ...body }, steps.join("\n"), true, b.key));
+    }
 });
 
 Promise.all([refreshProductCatalog(), setupTelegramWebhook(), refreshBizimHesapProducts()]).finally(() => {

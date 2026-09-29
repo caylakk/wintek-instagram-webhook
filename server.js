@@ -3,6 +3,13 @@ const express = require("express");
 const axios = require("axios");
 const Anthropic = require("@anthropic-ai/sdk");
 const { Redis } = require("@upstash/redis");
+const multer = require("multer");
+const XLSX = require("xlsx");
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+
+// BizimHesap'tan disa aktarilan ve manuel yuklenen WhatsApp musterileri bu
+// prefix altinda saklanir (organik conv:whatsapp:* listesinden ayri).
+const WA_IMPORTED_PREFIX = "wa:imported:";
 
 const app = express();
 app.use(express.json());
@@ -2142,8 +2149,21 @@ async function broadcastToAllCustomers(message, imageUrl, statusFilter, includeB
     return { total: recipientIds.length, sent, failed, results };
 }
 
+// BizimHesap'tan yuklenen 10 haneli cep telefonlarini WhatsApp'in bekledigi
+// 90XXXXXXXXXX formatina cevirir; gecersiz/sabit hat numaralarinda null doner.
+function normalizeTurkishMobile(raw) {
+    let digits = String(raw || "").replace(/[^0-9]/g, "");
+    if (digits.startsWith("0")) digits = digits.slice(1);
+    if (digits.startsWith("90") && digits.length === 12) digits = digits.slice(2);
+    if (digits.length !== 10 || !digits.startsWith("5")) return null;
+    return "90" + digits;
+}
+
 // WhatsApp tarafinda kayitli musteri listesi Instagram'daki conv:dm:* ile ayni
-// mantikla, conv:whatsapp:* Redis anahtarlari taranarak cikartilir.
+// mantikla, conv:whatsapp:* Redis anahtarlari taranarak cikartilir. Ayrica
+// BizimHesap'tan yuklenen (wa:imported:*) "soguk" musteriler de - bir durum
+// filtresi uygulanmadigi surece - bu listeye eklenir (onlarin konusma
+// gecmisinden gelen bir lead durumu olmadigi icin).
 async function getAllWhatsAppCustomerIds(statusFilter) {
     if (!redis) return [];
     try {
@@ -2152,6 +2172,16 @@ async function getAllWhatsAppCustomerIds(statusFilter) {
         if (statusFilter) {
             const statuses = await Promise.all(ids.map((id) => getLeadStatus("whatsapp", id)));
             ids = ids.filter((_, i) => statuses[i] === statusFilter);
+        } else {
+            const importedKeys = await redis.keys(`${WA_IMPORTED_PREFIX}*`);
+            const importedIds = importedKeys.map((k) => k.replace(WA_IMPORTED_PREFIX, "")).filter(Boolean);
+            const existing = new Set(ids);
+            for (const id of importedIds) {
+                if (!existing.has(id)) {
+                    ids.push(id);
+                    existing.add(id);
+                }
+            }
         }
         return ids;
     } catch (err) {
@@ -2315,6 +2345,7 @@ app.get("/broadcast", (req, res) => {
     </label>
     <button type="submit">Gonder</button>
     </form>
+    <p><a href="/broadcast/import?key=${key}">Musteri listesi yukle (BizimHesap) &rarr;</a></p>
     <p><a href="/panel?key=${key}">Musteri konusmalarini goruntule &rarr;</a></p>
     </body>
     </html>`);
@@ -2378,6 +2409,143 @@ app.post("/broadcast", async (req, res) => {
     <p><a href="/broadcast?key=${key}">&larr; Yeni mesaj gonder</a></p>
     </body>
     </html>`);
+});
+
+// BizimHesap'tan disa aktarilan musteri listesini (CSV/XLSX) yukleme sayfasi.
+app.get("/broadcast/import", (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+
+    const key = escapeHtml(req.query.key);
+    const notice = req.query.ok
+        ? `<div class="ok"><strong>Yukleme tamamlandi.</strong> Toplam satir: ${escapeHtml(req.query.total || "0")}, eklenen: ${escapeHtml(req.query.added || "0")}, zaten kayitli (atlandi): ${escapeHtml(req.query.skippedExisting || "0")}, gecersiz numara (atlandi): ${escapeHtml(req.query.skippedInvalid || "0")}.</div>`
+        : "";
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Musteri Listesi Yukle - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+    h1 { font-size: 1.4em; }
+    input[type=file] { width: 100%; font-size: 1em; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
+    label { display: block; margin-top: 16px; font-weight: bold; }
+    button { margin-top: 20px; padding: 12px 24px; font-size: 1em; background: #2e7d32; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    .warn { background: #fff4e5; border: 1px solid #ffb74d; padding: 12px; border-radius: 6px; margin-top: 20px; font-size: 0.92em; }
+    .ok { background: #e8f5e9; border: 1px solid #66bb6a; padding: 12px; border-radius: 6px; margin-bottom: 20px; font-size: 0.92em; }
+    </style>
+    </head>
+    <body>
+    <h1>BizimHesap Musteri Listesi Yukle</h1>
+    ${notice}
+    <div class="warn">
+    BizimHesap'tan disa aktardigin musteri listesini (.csv veya .xlsx) buradan yukleyebilirsin. Telefon numarasi ve musteri adi sutunlari otomatik bulunur. Gecerli bir cep telefonu numarasina (05XX... veya 5XX...) sahip olmayan satirlar atlanir, zaten kayitli numaralar tekrar eklenmez. Bu islem sadece WhatsApp toplu mesaj listesine ekler; mevcut hicbir kaydi silmez.
+    </div>
+    <form method="POST" action="/broadcast/import?key=${key}" enctype="multipart/form-data">
+    <label for="file">Musteri Listesi Dosyasi (.csv / .xlsx)</label>
+    <input type="file" name="file" id="file" accept=".csv,.xlsx,.xls" required>
+    <button type="submit">Yukle</button>
+    </form>
+    <p><a href="/broadcast?key=${key}">&larr; Toplu mesaj sayfasina don</a></p>
+    </body>
+    </html>`);
+});
+
+// Yuklenen dosyadaki telefon/isim sutunlarini esnek basliklarla bulur.
+function findColumnKey(row, candidates) {
+    const keys = Object.keys(row);
+    for (const candidate of candidates) {
+        const found = keys.find((k) => k.trim().toLowerCase() === candidate);
+        if (found) return found;
+    }
+    // Tam eslesme yoksa, aday metni iceren ilk basligi kullan.
+    for (const candidate of candidates) {
+        const found = keys.find((k) => k.trim().toLowerCase().includes(candidate));
+        if (found) return found;
+    }
+    return null;
+}
+
+app.post("/broadcast/import", upload.single("file"), async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+
+    const key = escapeHtml(req.query.key || req.body.key);
+    if (!req.file) {
+        res.status(400).send("Dosya yuklenmedi.");
+        return;
+    }
+    if (!redis) {
+        res.status(503).send("Redis yapilandirilmamis, musteri listesi kaydedilemiyor.");
+        return;
+    }
+
+    let rows;
+    try {
+        const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+        const firstSheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[firstSheetName];
+        rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    } catch (err) {
+        res.status(400).send(`Dosya okunamadi: ${escapeHtml(err.message)}`);
+        return;
+    }
+
+    const phoneCandidates = ["telefon", "phone", "gsm", "cep telefonu", "cep"];
+    const nameCandidates = ["müşteri adı / ünvanı", "musteri adi / unvani", "ad soyad", "isim", "name", "müşteri adı", "musteri adi"];
+
+    let total = 0;
+    let added = 0;
+    let skippedExisting = 0;
+    let skippedInvalid = 0;
+    const invalidSamples = [];
+
+    for (const row of rows) {
+        if (!row || Object.keys(row).length === 0) continue;
+        total += 1;
+
+        const phoneKey = findColumnKey(row, phoneCandidates);
+        const nameKey = findColumnKey(row, nameCandidates);
+        const rawPhone = phoneKey ? row[phoneKey] : "";
+        const name = nameKey ? String(row[nameKey] || "").trim() : "";
+
+        const normalized = normalizeTurkishMobile(rawPhone);
+        if (!normalized) {
+            skippedInvalid += 1;
+            if (invalidSamples.length < 10) invalidSamples.push(String(rawPhone || "(bos)"));
+            continue;
+        }
+
+        try {
+            const alreadyOrganic = await redis.exists(`conv:whatsapp:${normalized}`);
+            const alreadyImported = await redis.exists(`${WA_IMPORTED_PREFIX}${normalized}`);
+            if (alreadyOrganic || alreadyImported) {
+                skippedExisting += 1;
+                continue;
+            }
+            await redis.set(
+                `${WA_IMPORTED_PREFIX}${normalized}`,
+                JSON.stringify({ name, importedAt: new Date().toISOString() })
+            );
+            added += 1;
+        } catch (err) {
+            console.error("Musteri kaydi yazilamadi:", normalized, err.message);
+            skippedInvalid += 1;
+        }
+    }
+
+    console.log(`Musteri listesi yuklendi. Toplam: ${total}, eklenen: ${added}, mevcut(atlandi): ${skippedExisting}, gecersiz(atlandi): ${skippedInvalid}`);
+
+    const params = new URLSearchParams({
+        key: req.query.key || req.body.key || "",
+        ok: "1",
+        total: String(total),
+        added: String(added),
+        skippedExisting: String(skippedExisting),
+        skippedInvalid: String(skippedInvalid),
+    });
+    res.redirect(`/broadcast/import?${params.toString()}`);
 });
 
 // Musteri/lead durumu takibi: her konusmaya (DM veya yorum) elle atanan bir

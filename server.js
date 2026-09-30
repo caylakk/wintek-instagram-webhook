@@ -622,6 +622,8 @@ const FORM_PAGE_STYLE = `
     p.intro { color: #555; margin-top: 0; }
     label { display: block; margin-top: 16px; font-weight: bold; }
     input[type=text], input[type=tel], input[type=email], input[type=date], select { width: 100%; font-size: 1em; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; background: #fff; }
+    input[type=file] { width: 100%; font-size: 0.95em; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; background: #fff; }
+    .hint { display: block; font-weight: normal; color: #777; font-size: 0.85em; margin-top: 4px; }
     textarea { width: 100%; min-height: 110px; font-size: 1em; font-family: inherit; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
     button { margin-top: 22px; padding: 12px 24px; font-size: 1em; background: #d32f2f; color: #fff; border: none; border-radius: 6px; cursor: pointer; width: 100%; }
     button:hover { background: #b71c1c; }
@@ -630,9 +632,10 @@ const FORM_PAGE_STYLE = `
     .consent input { margin-top: 4px; }
     .hp { position: absolute; left: -9999px; }`;
 
-function renderFormPage({ title, intro, action, fieldsHtml, buttonText, query }) {
+function renderFormPage({ title, intro, action, fieldsHtml, buttonText, query, enctype }) {
     const kanal = escapeHtml(String(query?.kanal || "web").slice(0, 20));
     const musteri = escapeHtml(String(query?.musteri || "").slice(0, 60));
+    const enctypeAttr = enctype ? ` enctype="${escapeHtml(enctype)}"` : "";
     return `<!DOCTYPE html>
     <html lang="tr">
     <head>
@@ -645,7 +648,7 @@ function renderFormPage({ title, intro, action, fieldsHtml, buttonText, query })
     <img src="${WINTEK_LOGO_DATA_URI}" alt="Wintek" style="display:block; max-width:220px; height:auto; margin:0 auto 24px;">
     <h1>${escapeHtml(title)}</h1>
     <p class="intro">${escapeHtml(intro)}</p>
-    <form method="POST" action="${action}">
+    <form method="POST" action="${action}"${enctypeAttr}>
     <input type="hidden" name="kanal" value="${kanal}">
     <input type="hidden" name="musteri" value="${musteri}">
     <div class="hp"><label for="website">Web sitesi</label><input type="text" name="website" id="website" tabindex="-1" autocomplete="off"></div>
@@ -674,7 +677,8 @@ function renderFormThanksPage(title, message) {
 }
 
 // Brevo (https://api.brevo.com) uzerinden form maili gonderir. fields: [[etiket, deger], ...]
-async function sendFormEmail(subject, fields, replyToEmail, replyToName) {
+// attachment (opsiyonel): { name, content } - content base64 string olmali.
+async function sendFormEmail(subject, fields, replyToEmail, replyToName, attachment) {
     if (!BREVO_API_KEY) {
         console.warn(`BREVO_API_KEY tanimli degil - form maili gonderilmedi (${subject}).`);
         return false;
@@ -697,6 +701,9 @@ async function sendFormEmail(subject, fields, replyToEmail, replyToName) {
     if (replyToEmail && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(replyToEmail)) {
         body.replyTo = { email: replyToEmail, name: replyToName || replyToEmail };
     }
+    if (attachment && attachment.content) {
+        body.attachment = [{ name: attachment.name, content: attachment.content }];
+    }
     try {
         await axios.post("https://api.brevo.com/v3/smtp/email", body, {
             headers: { "api-key": BREVO_API_KEY, "content-type": "application/json", accept: "application/json" },
@@ -711,7 +718,8 @@ async function sendFormEmail(subject, fields, replyToEmail, replyToName) {
 }
 
 // Iki formun ortak kaydetme/bildirme/mail akisi.
-async function handleFormSubmission({ type, emoji, title, fields, adSoyad, eposta, kanal, musteri }) {
+// attachment (opsiyonel): { name, content } - mail'e eklenir (ornegin iade formundaki fatura fotografi).
+async function handleFormSubmission({ type, emoji, title, fields, adSoyad, eposta, kanal, musteri, attachment }) {
     const record = { type, kanal, musteri, fields: Object.fromEntries(fields), timestamp: Date.now() };
     if (redis) {
         try {
@@ -731,7 +739,8 @@ async function handleFormSubmission({ type, emoji, title, fields, adSoyad, epost
         `${title} - ${adSoyad}`,
         [...fields, ["Kanal", kanal || "web"], ...(musteri ? [["Müşteri kimliği", musteri]] : [])],
         eposta,
-        adSoyad
+        adSoyad,
+        attachment
     );
 }
 
@@ -799,6 +808,7 @@ app.get("/iade-garanti", (req, res) => {
         action: "/iade-garanti",
         buttonText: "Talebi Gönder",
         query: req.query,
+        enctype: "multipart/form-data",
         fieldsHtml: `
     <label for="adSoyad">Ad Soyad <span class="req">*</span></label>
     <input type="text" name="adSoyad" id="adSoyad" required>
@@ -821,11 +831,30 @@ app.get("/iade-garanti", (req, res) => {
     <label for="urun">Ürün Adı / Kodu <span class="req">*</span></label>
     <input type="text" name="urun" id="urun" required>
     <label for="aciklama">Açıklama <span class="req">*</span></label>
-    <textarea name="aciklama" id="aciklama" placeholder="İade / garanti sebebinizi kısaca açıklayın." required></textarea>`,
+    <textarea name="aciklama" id="aciklama" placeholder="İade / garanti sebebinizi kısaca açıklayın." required></textarea>
+    <label for="fatura">Fatura Fotoğrafı / Görseli (opsiyonel)
+    <span class="hint">Telefonda kamerayı açıp fotoğraf çekebilir, ya da galeriden dosya seçebilirsiniz. (JPG/PNG/PDF, en fazla 5 MB)</span>
+    </label>
+    <input type="file" name="fatura" id="fatura" accept="image/*,.pdf" capture="environment">`,
     }));
 });
 
-app.post("/iade-garanti", async (req, res) => {
+// Fatura dosyasi sadece resim veya PDF olabilir; baska bir tur secilirse reddedilir.
+const FATURA_ALLOWED_MIME = /^image\/(jpeg|png|webp|heic|heif)$|^application\/pdf$/;
+
+app.post("/iade-garanti", (req, res, next) => {
+    upload.single("fatura")(req, res, (err) => {
+        if (err) {
+            const msg =
+                err.code === "LIMIT_FILE_SIZE"
+                    ? "Yüklediğiniz fatura dosyası çok büyük (en fazla 5 MB olabilir). Lütfen daha küçük bir dosya/fotoğraf ile tekrar deneyin."
+                    : "Fatura dosyası yüklenemedi. Lütfen tekrar deneyin.";
+            res.status(400).send(msg);
+            return;
+        }
+        next();
+    });
+}, async (req, res) => {
     if (req.body.website) {
         res.send(renderFormThanksPage("Talebiniz alındı", "Teşekkürler."));
         return;
@@ -842,15 +871,25 @@ app.post("/iade-garanti", async (req, res) => {
         res.status(400).send("Lütfen zorunlu alanları doldurup onay kutusunu işaretleyin ve tekrar deneyin.");
         return;
     }
+    let attachment = null;
+    if (req.file) {
+        if (!FATURA_ALLOWED_MIME.test(req.file.mimetype)) {
+            res.status(400).send("Fatura dosyası yalnızca JPG, PNG, HEIC veya PDF olabilir. Lütfen tekrar deneyin.");
+            return;
+        }
+        const ext = (req.file.originalname.match(/\.[a-zA-Z0-9]+$/) || [""])[0] || (req.file.mimetype === "application/pdf" ? ".pdf" : ".jpg");
+        attachment = { name: `fatura-${Date.now()}${ext}`, content: req.file.buffer.toString("base64") };
+    }
     await handleFormSubmission({
         type: "iade-garanti",
         emoji: "🔄",
         title: `${talepTuru} Talebi`,
-        fields: [["Ad Soyad", adSoyad], ["Telefon", telefon], ["E-posta", eposta], ["Talep Türü", talepTuru], ["Fatura / Sipariş No", siparisNo], ["Satın Alma Tarihi", tarih], ["Ürün", urun], ["Açıklama", aciklama]],
+        fields: [["Ad Soyad", adSoyad], ["Telefon", telefon], ["E-posta", eposta], ["Talep Türü", talepTuru], ["Fatura / Sipariş No", siparisNo], ["Satın Alma Tarihi", tarih], ["Ürün", urun], ["Açıklama", aciklama], ["Fatura Görseli", attachment ? "Ekte" : ""]],
         adSoyad,
         eposta,
         kanal: clean(req.body.kanal, 20),
         musteri: clean(req.body.musteri, 60),
+        attachment,
     });
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(renderFormThanksPage("Talebiniz alındı", `Teşekkürler ${adSoyad}, ${talepTuru.toLocaleLowerCase("tr")} talebiniz bize ulaştı. Ekibimiz en kısa sürede sizinle iletişime geçecek.`));

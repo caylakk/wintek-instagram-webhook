@@ -760,7 +760,7 @@ const isValidEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || ""));
 
 // Brevo uzerinden serbest (herhangi bir aliciya) mail gonderen genel yardimci.
 // sendFormEmail'den farkli olarak sabit MAIL_TO'ya degil, verilen adrese gider.
-async function sendBrevoMail({ toEmail, toName, subject, html, replyToEmail, replyToName }) {
+async function sendBrevoMail({ toEmail, toName, subject, html, replyToEmail, replyToName, attachment }) {
     if (!BREVO_API_KEY) {
         console.warn(`BREVO_API_KEY tanimli degil - mail gonderilmedi (${subject}).`);
         return false;
@@ -777,6 +777,9 @@ async function sendBrevoMail({ toEmail, toName, subject, html, replyToEmail, rep
     };
     if (replyToEmail && isValidEmail(replyToEmail)) {
         body.replyTo = { email: replyToEmail, name: replyToName || replyToEmail };
+    }
+    if (attachment && attachment.content) {
+        body.attachment = [{ name: attachment.name, content: attachment.content }];
     }
     try {
         await axios.post("https://api.brevo.com/v3/smtp/email", body, {
@@ -1277,7 +1280,7 @@ app.get("/personel-iade-talep", async (req, res) => {
     <h1>Wintek İade Talep Formu</h1>
     <p class="intro">Müşteriden aldığınız iadeyi bu formdan bildirin; talep muhasebeye iletilecek ve onaylandığında size bildirim gelecek.</p>
     ${uyari}
-    <form method="POST" action="/personel-iade-talep">
+    <form method="POST" action="/personel-iade-talep" enctype="multipart/form-data">
     <label for="personelAdi">Personel Adı <span class="req">*</span></label>
     <select name="personelAdi" id="personelAdi" required>
         <option value="">Seçiniz</option>
@@ -1295,13 +1298,29 @@ app.get("/personel-iade-talep", async (req, res) => {
     <input type="text" name="tutar" id="tutar" placeholder="örn. 350">
     <label for="aciklama">İade Nedeni / Açıklama <span class="req">*</span></label>
     <textarea name="aciklama" id="aciklama" placeholder="İade sebebini kısaca açıklayın." required></textarea>
+    <label for="fatura">Fatura Fotoğrafı / Görseli (opsiyonel)
+    <span class="hint">Telefonda kamerayı açıp fotoğraf çekebilir, ya da galeriden dosya seçebilirsiniz. (JPG/PNG/PDF, en fazla 5 MB)</span>
+    </label>
+    <input type="file" name="fatura" id="fatura" accept="image/*,.pdf" capture="environment">
     <button type="submit">Talebi Gönder</button>
     </form>
     </body>
     </html>`);
 });
 
-app.post("/personel-iade-talep", async (req, res) => {
+app.post("/personel-iade-talep", (req, res, next) => {
+    upload.single("fatura")(req, res, (err) => {
+        if (err) {
+            const msg =
+                err.code === "LIMIT_FILE_SIZE"
+                    ? "Yüklediğiniz fatura dosyası çok büyük (en fazla 5 MB olabilir). Lütfen daha küçük bir dosya/fotoğraf ile tekrar deneyin."
+                    : "Fatura dosyası yüklenemedi. Lütfen tekrar deneyin.";
+            res.status(400).send(msg);
+            return;
+        }
+        next();
+    });
+}, async (req, res) => {
     const personelAdi = clean(req.body.personelAdi, 120);
     const musteriAdi = clean(req.body.musteriAdi, 120);
     const musteriTelefon = clean(req.body.musteriTelefon, 40);
@@ -1313,6 +1332,16 @@ app.post("/personel-iade-talep", async (req, res) => {
     if (!personelAdi || !musteriAdi || !musteriTelefon || !urun || !aciklama) {
         res.status(400).send("Lütfen zorunlu alanları doldurup tekrar deneyin.");
         return;
+    }
+
+    let attachment = null;
+    if (req.file) {
+        if (!FATURA_ALLOWED_MIME.test(req.file.mimetype)) {
+            res.status(400).send("Fatura dosyası yalnızca JPG, PNG, HEIC veya PDF olabilir. Lütfen tekrar deneyin.");
+            return;
+        }
+        const ext = (req.file.originalname.match(/\.[a-zA-Z0-9]+$/) || [""])[0] || (req.file.mimetype === "application/pdf" ? ".pdf" : ".jpg");
+        attachment = { name: `fatura-${Date.now()}${ext}`, content: req.file.buffer.toString("base64") };
     }
 
     const id = crypto.randomUUID();
@@ -1348,6 +1377,7 @@ app.post("/personel-iade-talep", async (req, res) => {
         ["Fatura / Sipariş No", siparisNo],
         ["Tutar", tutar],
         ["Açıklama", aciklama],
+        ["Fatura Görseli", attachment ? "Ekte" : ""],
     ]
         .filter(([, v]) => v)
         .map(([k, v]) => `<tr><td style="padding:8px 12px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7;vertical-align:top;white-space:nowrap">${escapeHtml(k)}</td><td style="padding:8px 12px;border:1px solid #ddd;white-space:pre-wrap">${escapeHtml(v)}</td></tr>`)
@@ -1363,6 +1393,7 @@ app.post("/personel-iade-talep", async (req, res) => {
         toName: "Wintek Muhasebe",
         subject: `İade Talebi - ${personelAdi} (${musteriAdi})`,
         html,
+        attachment,
     });
     notifyAdmin(
         `🧾 <b>Yeni Personel İade Talebi</b>\nPersonel: ${escapeHtml(personelAdi)}\nMüşteri: ${escapeHtml(musteriAdi)}\nÜrün: ${escapeHtml(urun)}`

@@ -68,6 +68,9 @@ const PERSONEL_IADE_MAIL_TO = process.env.PERSONEL_IADE_MAIL_TO || "muhasebe@win
 const PERSONEL_LISTESI_KEY = "personel:liste"; // JSON dizi: [{isim, eposta}, ...]
 const PERSONEL_IADE_TALEPLER_KEY = "personel:iade:talepler"; // Redis hash: id -> JSON kayit
 const PERSONEL_IADE_TALEPLER_MAX = 1000;
+const PERSONEL_IADE_REMINDER_ESIK_MS = 24 * 60 * 60 * 1000; // bu sureden uzun beklemede olan talepler hatirlatilir
+const PERSONEL_IADE_REMINDER_TEKRAR_MS = 24 * 60 * 60 * 1000; // ayni talep icin en fazla gunde bir kez hatirlat
+const PERSONEL_IADE_REMINDER_CHECK_MS = 60 * 60 * 1000; // kontrol sikligi: saatte bir
 // WhatsApp karsilama menusundeki butonlarin kimlikleri
 const WA_MENU_SUPPORT = "WA_MENU_SUPPORT";
 const WA_MENU_RETURN = "WA_MENU_RETURN";
@@ -761,6 +764,13 @@ async function handleFormSubmission({ type, emoji, title, fields, adSoyad, epost
 
 const clean = (v, max = 2000) => String(v || "").trim().slice(0, max);
 const isValidEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || ""));
+// Sayisal tutari "1.234,50 ₺" seklinde Turkce formatla gosterir. Bos/gecersiz deger icin "" doner.
+const formatTutar = (v) => {
+    if (v === "" || v === null || v === undefined) return "";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "";
+    return `${n.toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₺`;
+};
 
 // Brevo uzerinden serbest (herhangi bir aliciya) mail gonderen genel yardimci.
 // sendFormEmail'den farkli olarak sabit MAIL_TO'ya degil, verilen adrese gider.
@@ -1301,7 +1311,7 @@ app.get("/personel-iade-talep", async (req, res) => {
     <label for="siparisNo">Fatura / Sipariş No</label>
     <input type="text" name="siparisNo" id="siparisNo">
     <label for="tutar">Tutar (TL)</label>
-    <input type="text" name="tutar" id="tutar" placeholder="örn. 350">
+    <input type="number" name="tutar" id="tutar" placeholder="örn. 350" min="0" step="0.01" inputmode="decimal">
     <label for="aciklama">İade Nedeni / Açıklama <span class="req">*</span></label>
     <textarea name="aciklama" id="aciklama" placeholder="İade sebebini kısaca açıklayın." required></textarea>
     <label>Fatura Fotoğrafı / Görseli (opsiyonel)
@@ -1354,7 +1364,7 @@ app.post("/personel-iade-talep", (req, res, next) => {
     const musteriTelefon = clean(req.body.musteriTelefon, 40);
     const urun = clean(req.body.urun, 1000);
     const siparisNo = clean(req.body.siparisNo, 80);
-    const tutar = clean(req.body.tutar, 40);
+    const tutarRaw = clean(req.body.tutar, 40);
     const aciklama = clean(req.body.aciklama);
 
     if (!personelAdi || !musteriAdi || !musteriTelefon || !urun || !aciklama) {
@@ -1362,8 +1372,19 @@ app.post("/personel-iade-talep", (req, res, next) => {
         return;
     }
 
+    let tutar = "";
+    if (tutarRaw) {
+        const tutarNum = Number(tutarRaw.replace(",", "."));
+        if (!Number.isFinite(tutarNum) || tutarNum < 0) {
+            res.status(400).send("Tutar alanı geçerli bir sayı olmalıdır (örn. 350 veya 350.50).");
+            return;
+        }
+        tutar = tutarNum;
+    }
+
     const faturaFile = (req.files && (req.files.faturaDosya?.[0] || req.files.faturaFoto?.[0])) || null;
     let attachment = null;
+    let faturaGorseli = null;
     if (faturaFile) {
         if (!FATURA_ALLOWED_MIME.test(faturaFile.mimetype)) {
             res.status(400).send("Fatura dosyası yalnızca JPG, PNG, HEIC veya PDF olabilir. Lütfen tekrar deneyin.");
@@ -1371,6 +1392,11 @@ app.post("/personel-iade-talep", (req, res, next) => {
         }
         const ext = (faturaFile.originalname.match(/\.[a-zA-Z0-9]+$/) || [""])[0] || (faturaFile.mimetype === "application/pdf" ? ".pdf" : ".jpg");
         attachment = { name: `fatura-${Date.now()}${ext}`, content: faturaFile.buffer.toString("base64") };
+        // Admin panelinde gosterebilmek icin sadece kucuk gorselleri (<=1MB) kayda da ekliyoruz;
+        // daha buyuk dosyalar Redis'e yazilmiyor, yalnizca yukaridaki mail ekinde kaliyor.
+        if (faturaFile.buffer.length <= 1_000_000) {
+            faturaGorseli = { mime: faturaFile.mimetype, data: faturaFile.buffer.toString("base64") };
+        }
     }
 
     const id = crypto.randomUUID();
@@ -1383,6 +1409,7 @@ app.post("/personel-iade-talep", (req, res, next) => {
         siparisNo,
         tutar,
         aciklama,
+        faturaGorseli,
         durum: "beklemede",
         timestamp: Date.now(),
     };
@@ -1404,7 +1431,7 @@ app.post("/personel-iade-talep", (req, res, next) => {
         ["Müşteri Telefon", musteriTelefon],
         ["Ürün", urun],
         ["Fatura / Sipariş No", siparisNo],
-        ["Tutar", tutar],
+        ["Tutar", formatTutar(tutar)],
         ["Açıklama", aciklama],
         ["Fatura Görseli", attachment ? "Ekte" : ""],
     ]
@@ -1490,6 +1517,12 @@ app.get("/admin/personel-iade/:id", async (req, res) => {
         return;
     }
 
+    const faturaGorselHtml = record.faturaGorseli
+        ? record.faturaGorseli.mime === "application/pdf"
+            ? `<p style="margin-top:16px"><a href="data:${record.faturaGorseli.mime};base64,${record.faturaGorseli.data}" target="_blank" rel="noopener" style="display:inline-block;padding:10px 16px;background:#1565c0;color:#fff;text-decoration:none;border-radius:6px;">📄 Fatura PDF'ini Görüntüle</a></p>`
+            : `<p style="margin-top:16px;font-weight:bold">Fatura Görseli</p><img src="data:${record.faturaGorseli.mime};base64,${record.faturaGorseli.data}" alt="Fatura görseli" style="max-width:100%;border:1px solid #ddd;border-radius:8px;margin-top:6px">`
+        : "";
+
     const aksiyonlar = record.durum === "beklemede"
         ? `<div style="margin-top:20px">
              <form method="POST" action="/admin/personel-iade/${record.id}/onayla?key=${key}">
@@ -1524,9 +1557,10 @@ app.get("/admin/personel-iade/:id", async (req, res) => {
     <tr><th>Müşteri Telefon</th><td>${escapeHtml(record.musteriTelefon)}</td></tr>
     <tr><th>Ürün</th><td style="white-space:pre-wrap">${escapeHtml(record.urun)}</td></tr>
     <tr><th>Fatura / Sipariş No</th><td>${escapeHtml(record.siparisNo || "-")}</td></tr>
-    <tr><th>Tutar</th><td>${escapeHtml(record.tutar || "-")}</td></tr>
+    <tr><th>Tutar</th><td>${record.tutar !== "" && record.tutar != null ? escapeHtml(formatTutar(record.tutar)) : "-"}</td></tr>
     <tr><th>Açıklama</th><td style="white-space:pre-wrap">${escapeHtml(record.aciklama)}</td></tr>
     </table>
+    ${faturaGorselHtml}
     ${aksiyonlar}
     <p style="margin-top:24px"><a href="/admin/personel-iade-talepleri?key=${key}">&larr; Tüm talepler</a></p>
     </body>
@@ -1556,7 +1590,7 @@ app.post("/admin/personel-iade/:id/onayla", async (req, res) => {
                 <p><strong>${escapeHtml(record.musteriAdi)}</strong> için girdiğiniz iade talebi onaylandı.</p>
                 <table style="border-collapse:collapse">
                 <tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Ürün</td><td style="padding:6px 10px;border:1px solid #ddd;white-space:pre-wrap">${escapeHtml(record.urun)}</td></tr>
-                ${record.tutar ? `<tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Tutar</td><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(record.tutar)}</td></tr>` : ""}
+                ${record.tutar !== "" && record.tutar != null ? `<tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Tutar</td><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(formatTutar(record.tutar))}</td></tr>` : ""}
                 </table>
                 <p style="color:#777;font-size:12px;margin-top:16px">Bu mail Wintek personel iade sisteminden otomatik olarak gönderildi.</p>
             </div>`;
@@ -1586,9 +1620,90 @@ app.post("/admin/personel-iade/:id/reddet", async (req, res) => {
         record.karar_tarihi = Date.now();
         record.redSebebi = clean(req.body.redSebebi, 500);
         await savePersonelIadeTalep(record);
+
+        const personeller = await getPersonelListesi();
+        const personel = personeller.find(
+            (p) => p.isim.trim().toLocaleLowerCase("tr") === record.personelAdi.trim().toLocaleLowerCase("tr")
+        );
+        if (personel) {
+            const html = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222">
+                <h2 style="color:#d32f2f;margin:0 0 12px">İade Talebiniz Reddedildi ❌</h2>
+                <p><strong>${escapeHtml(record.musteriAdi)}</strong> için girdiğiniz iade talebi reddedildi.</p>
+                <table style="border-collapse:collapse">
+                <tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Ürün</td><td style="padding:6px 10px;border:1px solid #ddd;white-space:pre-wrap">${escapeHtml(record.urun)}</td></tr>
+                ${record.redSebebi ? `<tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Red Sebebi</td><td style="padding:6px 10px;border:1px solid #ddd;white-space:pre-wrap">${escapeHtml(record.redSebebi)}</td></tr>` : ""}
+                </table>
+                <p style="color:#777;font-size:12px;margin-top:16px">Bu mail Wintek personel iade sisteminden otomatik olarak gönderildi.</p>
+            </div>`;
+            await sendBrevoMail({
+                toEmail: personel.eposta,
+                toName: personel.isim,
+                subject: `İade Talebiniz Reddedildi - ${record.musteriAdi}`,
+                html,
+            });
+        } else {
+            console.warn(`Personel listesinde eslesme bulunamadi, red maili gonderilemedi: "${record.personelAdi}"`);
+        }
     }
     res.redirect(`/admin/personel-iade/${record.id}?key=${key}`);
 });
+
+// Belirli bir suredir (PERSONEL_IADE_REMINDER_ESIK_MS) "beklemede" kalan personel iade
+// taleplerini periyodik olarak kontrol edip muhasebeye (mail) ve admin'e (Telegram) tek bir
+// ozet halinde hatirlatma gonderir. Ayni talep icin en fazla PERSONEL_IADE_REMINDER_TEKRAR_MS
+// sikliginda tekrar hatirlatilir (spam onlemek icin record.sonHatirlatma alaninda takip edilir).
+async function runPersonelIadeReminderCheck() {
+    if (!redis) return;
+    try {
+        const ids = await redis.lrange(`${PERSONEL_IADE_TALEPLER_KEY}:sira`, 0, -1);
+        const now = Date.now();
+        const gecikenler = [];
+        for (const id of ids) {
+            const record = await getPersonelIadeTalep(id);
+            if (!record || record.durum !== "beklemede") continue;
+            if (now - record.timestamp < PERSONEL_IADE_REMINDER_ESIK_MS) continue;
+            if (record.sonHatirlatma && now - record.sonHatirlatma < PERSONEL_IADE_REMINDER_TEKRAR_MS) continue;
+            gecikenler.push(record);
+        }
+        if (gecikenler.length === 0) return;
+
+        const key = ADMIN_ACCESS_KEY || "";
+        const satirlar = gecikenler
+            .map((r) => {
+                const saat = Math.floor((now - r.timestamp) / (60 * 60 * 1000));
+                return `<tr><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(r.personelAdi)}</td><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(r.musteriAdi)}</td><td style="padding:6px 10px;border:1px solid #ddd">${saat} saat</td><td style="padding:6px 10px;border:1px solid #ddd"><a href="${PUBLIC_URL}/admin/personel-iade/${r.id}?key=${key}">İncele</a></td></tr>`;
+            })
+            .join("");
+        const html = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222">
+            <h2 style="color:#a35a00;margin:0 0 12px">⏰ Bekleyen İade Talepleri Hatırlatması</h2>
+            <p>${gecikenler.length} adet talep 24 saatten uzun süredir onay bekliyor:</p>
+            <table style="border-collapse:collapse">
+            <tr><th style="padding:6px 10px;border:1px solid #ddd;background:#f7f7f7">Personel</th><th style="padding:6px 10px;border:1px solid #ddd;background:#f7f7f7">Müşteri</th><th style="padding:6px 10px;border:1px solid #ddd;background:#f7f7f7">Bekleme Süresi</th><th style="padding:6px 10px;border:1px solid #ddd;background:#f7f7f7"></th></tr>
+            ${satirlar}
+            </table>
+            <p style="margin-top:16px"><a href="${PUBLIC_URL}/admin/personel-iade-talepleri?key=${key}">Tüm talepleri gör &rarr;</a></p>
+        </div>`;
+        await sendBrevoMail({
+            toEmail: PERSONEL_IADE_MAIL_TO,
+            toName: "Wintek Muhasebe",
+            subject: `⏰ ${gecikenler.length} bekleyen iade talebi var`,
+            html,
+        });
+        notifyAdmin(
+            `⏰ <b>${gecikenler.length} bekleyen personel iade talebi 24 saatten uzun süredir onay bekliyor.</b>\n` +
+            `${PUBLIC_URL}/admin/personel-iade-talepleri?key=${key}`
+        );
+
+        await Promise.all(
+            gecikenler.map((r) => {
+                r.sonHatirlatma = now;
+                return savePersonelIadeTalep(r);
+            })
+        );
+    } catch (err) {
+        console.error("Personel iade hatirlatma kontrolu basarisiz:", err.message);
+    }
+}
 
 app.post("/webhook", (req, res) => {
     res.status(200).send("EVENT_RECEIVED");
@@ -4237,3 +4352,4 @@ setInterval(refreshBizimHesapProducts, BIZIMHESAP_REFRESH_MS);
 setInterval(runInterestedFollowupCheck, FOLLOWUP_CHECK_INTERVAL_MS);
 setInterval(runSatisfactionFollowupCheck, FOLLOWUP_CHECK_INTERVAL_MS);
 setInterval(runWeeklyReportCheck, WEEKLY_REPORT_CHECK_INTERVAL_MS);
+setInterval(runPersonelIadeReminderCheck, PERSONEL_IADE_REMINDER_CHECK_MS);

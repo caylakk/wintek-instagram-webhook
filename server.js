@@ -634,6 +634,10 @@ const FORM_PAGE_STYLE = `
     label { display: block; margin-top: 16px; font-weight: bold; }
     input[type=text], input[type=tel], input[type=email], input[type=date], select { width: 100%; font-size: 1em; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; background: #fff; }
     input[type=file] { width: 100%; font-size: 0.95em; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; background: #fff; }
+    .file-row { display: flex; gap: 10px; margin-top: 8px; }
+    .file-btn { flex: 1; text-align: center; padding: 10px; font-size: 0.95em; font-weight: normal; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; color: #222; }
+    .file-btn input[type=file] { display: none; }
+    .file-selected { display: block; font-weight: normal; color: #2e7d32; font-size: 0.85em; margin-top: 6px; }
     .hint { display: block; font-weight: normal; color: #777; font-size: 0.85em; margin-top: 4px; }
     textarea { width: 100%; min-height: 110px; font-size: 1em; font-family: inherit; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
     button { margin-top: 22px; padding: 12px 24px; font-size: 1em; background: #d32f2f; color: #fff; border: none; border-radius: 6px; cursor: pointer; width: 100%; }
@@ -1298,18 +1302,40 @@ app.get("/personel-iade-talep", async (req, res) => {
     <input type="text" name="tutar" id="tutar" placeholder="örn. 350">
     <label for="aciklama">İade Nedeni / Açıklama <span class="req">*</span></label>
     <textarea name="aciklama" id="aciklama" placeholder="İade sebebini kısaca açıklayın." required></textarea>
-    <label for="fatura">Fatura Fotoğrafı / Görseli (opsiyonel)
-    <span class="hint">Telefonda kamerayı açıp fotoğraf çekebilir, ya da galeriden dosya seçebilirsiniz. (JPG/PNG/PDF, en fazla 5 MB)</span>
+    <label>Fatura Fotoğrafı / Görseli (opsiyonel)
+    <span class="hint">Galeriden dosya seçebilir ya da kamerayı açıp anında fotoğraf çekebilirsiniz. (JPG/PNG/PDF, en fazla 5 MB)</span>
     </label>
-    <input type="file" name="fatura" id="fatura" accept="image/*,.pdf" capture="environment">
+    <div class="file-row">
+        <label class="file-btn" for="faturaDosya">📁 Dosya Seç<input type="file" name="faturaDosya" id="faturaDosya" accept="image/*,.pdf"></label>
+        <label class="file-btn" for="faturaFoto">📷 Fotoğraf Çek<input type="file" name="faturaFoto" id="faturaFoto" accept="image/*" capture="environment"></label>
+    </div>
+    <span class="file-selected" id="faturaSecili"></span>
     <button type="submit">Talebi Gönder</button>
     </form>
+    <script>
+    (function () {
+        var dosya = document.getElementById("faturaDosya");
+        var foto = document.getElementById("faturaFoto");
+        var secili = document.getElementById("faturaSecili");
+        function handle(secilen, diger) {
+            if (secilen.files && secilen.files.length) {
+                diger.value = "";
+                secili.textContent = "Seçildi: " + secilen.files[0].name;
+            }
+        }
+        dosya.addEventListener("change", function () { handle(dosya, foto); });
+        foto.addEventListener("change", function () { handle(foto, dosya); });
+    })();
+    </script>
     </body>
     </html>`);
 });
 
 app.post("/personel-iade-talep", (req, res, next) => {
-    upload.single("fatura")(req, res, (err) => {
+    upload.fields([
+        { name: "faturaDosya", maxCount: 1 },
+        { name: "faturaFoto", maxCount: 1 },
+    ])(req, res, (err) => {
         if (err) {
             const msg =
                 err.code === "LIMIT_FILE_SIZE"
@@ -1334,14 +1360,15 @@ app.post("/personel-iade-talep", (req, res, next) => {
         return;
     }
 
+    const faturaFile = (req.files && (req.files.faturaDosya?.[0] || req.files.faturaFoto?.[0])) || null;
     let attachment = null;
-    if (req.file) {
-        if (!FATURA_ALLOWED_MIME.test(req.file.mimetype)) {
+    if (faturaFile) {
+        if (!FATURA_ALLOWED_MIME.test(faturaFile.mimetype)) {
             res.status(400).send("Fatura dosyası yalnızca JPG, PNG, HEIC veya PDF olabilir. Lütfen tekrar deneyin.");
             return;
         }
-        const ext = (req.file.originalname.match(/\.[a-zA-Z0-9]+$/) || [""])[0] || (req.file.mimetype === "application/pdf" ? ".pdf" : ".jpg");
-        attachment = { name: `fatura-${Date.now()}${ext}`, content: req.file.buffer.toString("base64") };
+        const ext = (faturaFile.originalname.match(/\.[a-zA-Z0-9]+$/) || [""])[0] || (faturaFile.mimetype === "application/pdf" ? ".pdf" : ".jpg");
+        attachment = { name: `fatura-${Date.now()}${ext}`, content: faturaFile.buffer.toString("base64") };
     }
 
     const id = crypto.randomUUID();
@@ -1462,13 +1489,20 @@ app.get("/admin/personel-iade/:id", async (req, res) => {
     }
 
     const aksiyonlar = record.durum === "beklemede"
-        ? `<form method="POST" action="/admin/personel-iade/${record.id}/onayla?key=${key}" style="display:inline-block;margin-right:10px">
-             <button type="submit" class="btn btn-onayla">Onayla</button>
-           </form>
-           <form method="POST" action="/admin/personel-iade/${record.id}/reddet?key=${key}" style="display:inline-block" onsubmit="return confirm('Bu talep reddedilsin mi?');">
-             <button type="submit" class="btn btn-reddet">Reddet</button>
-           </form>`
-        : `<p>Bu talep zaten <strong>${personelIadeBadge(record.durum)}</strong> olarak işaretlenmiş${record.karar_tarihi ? ` (${new Date(record.karar_tarihi).toLocaleString("tr-TR")})` : ""}.</p>`;
+        ? `<div style="margin-top:20px">
+             <form method="POST" action="/admin/personel-iade/${record.id}/onayla?key=${key}">
+               <button type="submit" class="btn btn-onayla">Onayla</button>
+             </form>
+           </div>
+           <div style="margin-top:16px;padding:14px;border:1px solid #f5c6c6;border-radius:8px;background:#fff8f8">
+             <form method="POST" action="/admin/personel-iade/${record.id}/reddet?key=${key}" onsubmit="return confirm('Bu talep reddedilsin mi?');">
+               <label for="redSebebi" style="margin-top:0">Red Sebebi / Açıklama</label>
+               <textarea name="redSebebi" id="redSebebi" placeholder="Reddetme sebebini kısaca yazın (opsiyonel)" style="min-height:70px"></textarea>
+               <button type="submit" class="btn btn-reddet">Reddet</button>
+             </form>
+           </div>`
+        : `<p>Bu talep zaten <strong>${personelIadeBadge(record.durum)}</strong> olarak işaretlenmiş${record.karar_tarihi ? ` (${new Date(record.karar_tarihi).toLocaleString("tr-TR")})` : ""}.</p>
+           ${record.durum === "reddedildi" && record.redSebebi ? `<p style="margin-top:8px"><strong>Red Sebebi:</strong> ${escapeHtml(record.redSebebi)}</p>` : ""}`;
 
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(`<!DOCTYPE html>
@@ -1548,6 +1582,7 @@ app.post("/admin/personel-iade/:id/reddet", async (req, res) => {
     if (record.durum === "beklemede") {
         record.durum = "reddedildi";
         record.karar_tarihi = Date.now();
+        record.redSebebi = clean(req.body.redSebebi, 500);
         await savePersonelIadeTalep(record);
     }
     res.redirect(`/admin/personel-iade/${record.id}?key=${key}`);

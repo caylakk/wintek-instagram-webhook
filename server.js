@@ -1294,8 +1294,10 @@ app.get("/personel-iade-talep", async (req, res) => {
     <input type="text" name="musteriAdi" id="musteriAdi" required>
     <label for="musteriTelefon">Müşteri Telefon <span class="req">*</span></label>
     <input type="tel" name="musteriTelefon" id="musteriTelefon" required>
-    <label for="urun">Ürün Adı / Kodu <span class="req">*</span></label>
-    <input type="text" name="urun" id="urun" required>
+    <label for="urun">Ürün Adı / Kodu <span class="req">*</span>
+    <span class="hint">Birden fazla ürün varsa her birini ayrı satıra yazın.</span>
+    </label>
+    <textarea name="urun" id="urun" placeholder="örn.&#10;Fren Balata Temizleme Sprey&#10;W170119" style="min-height:70px" required></textarea>
     <label for="siparisNo">Fatura / Sipariş No</label>
     <input type="text" name="siparisNo" id="siparisNo">
     <label for="tutar">Tutar (TL)</label>
@@ -1350,7 +1352,7 @@ app.post("/personel-iade-talep", (req, res, next) => {
     const personelAdi = clean(req.body.personelAdi, 120);
     const musteriAdi = clean(req.body.musteriAdi, 120);
     const musteriTelefon = clean(req.body.musteriTelefon, 40);
-    const urun = clean(req.body.urun, 200);
+    const urun = clean(req.body.urun, 1000);
     const siparisNo = clean(req.body.siparisNo, 80);
     const tutar = clean(req.body.tutar, 40);
     const aciklama = clean(req.body.aciklama);
@@ -1451,7 +1453,7 @@ app.get("/admin/personel-iade-talepleri", async (req, res) => {
             <td>${new Date(r.timestamp).toLocaleString("tr-TR")}</td>
             <td>${escapeHtml(r.personelAdi)}</td>
             <td>${escapeHtml(r.musteriAdi)}</td>
-            <td>${escapeHtml(r.urun)}</td>
+            <td style="white-space:pre-line">${escapeHtml(r.urun)}</td>
             <td>${personelIadeBadge(r.durum)}</td>
             <td><a href="/admin/personel-iade/${r.id}?key=${key}">Detay</a></td>
             </tr>`
@@ -1520,7 +1522,7 @@ app.get("/admin/personel-iade/:id", async (req, res) => {
     <tr><th>Personel</th><td>${escapeHtml(record.personelAdi)}</td></tr>
     <tr><th>Müşteri</th><td>${escapeHtml(record.musteriAdi)}</td></tr>
     <tr><th>Müşteri Telefon</th><td>${escapeHtml(record.musteriTelefon)}</td></tr>
-    <tr><th>Ürün</th><td>${escapeHtml(record.urun)}</td></tr>
+    <tr><th>Ürün</th><td style="white-space:pre-wrap">${escapeHtml(record.urun)}</td></tr>
     <tr><th>Fatura / Sipariş No</th><td>${escapeHtml(record.siparisNo || "-")}</td></tr>
     <tr><th>Tutar</th><td>${escapeHtml(record.tutar || "-")}</td></tr>
     <tr><th>Açıklama</th><td style="white-space:pre-wrap">${escapeHtml(record.aciklama)}</td></tr>
@@ -1553,7 +1555,7 @@ app.post("/admin/personel-iade/:id/onayla", async (req, res) => {
                 <h2 style="color:#2e7d32;margin:0 0 12px">İade Talebiniz Onaylandı ✅</h2>
                 <p><strong>${escapeHtml(record.musteriAdi)}</strong> için girdiğiniz iade talebi onaylandı.</p>
                 <table style="border-collapse:collapse">
-                <tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Ürün</td><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(record.urun)}</td></tr>
+                <tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Ürün</td><td style="padding:6px 10px;border:1px solid #ddd;white-space:pre-wrap">${escapeHtml(record.urun)}</td></tr>
                 ${record.tutar ? `<tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Tutar</td><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(record.tutar)}</td></tr>` : ""}
                 </table>
                 <p style="color:#777;font-size:12px;margin-top:16px">Bu mail Wintek personel iade sisteminden otomatik olarak gönderildi.</p>

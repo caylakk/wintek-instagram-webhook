@@ -1235,6 +1235,7 @@ app.get("/admin/personel-listesi", async (req, res) => {
     <style>${ADMIN_PAGE_STYLE}</style>
     </head>
     <body>
+    <p style="text-align:right;margin:0"><a href="/admin/logout" style="font-size:0.85em;color:#777">Çıkış Yap</a></p>
     <h1>Personel Listesi</h1>
     <p class="intro">Burada eklenen personel, "Wintek İade Talep Formu"nda isim olarak seçilebilir ve iade onaylandığında bildirim maili bu adrese gider.</p>
     <table>
@@ -1430,7 +1431,7 @@ app.post("/personel-iade-talep", (req, res, next) => {
         }
     }
 
-    const detayUrl = `${PUBLIC_URL}/admin/personel-iade/${id}?key=${ADMIN_ACCESS_KEY || ""}`;
+    const detayUrl = `${PUBLIC_URL}/admin/personel-iade/${id}`;
     const fieldsHtml = [
         ["Personel", personelAdi],
         ["Müşteri", musteriAdi],
@@ -1593,6 +1594,7 @@ app.get("/admin/personel-iade-talepleri", async (req, res) => {
     </style>
     </head>
     <body>
+    <p style="text-align:right;margin:0"><a href="/admin/logout" style="font-size:0.85em;color:#777">Çıkış Yap</a></p>
     <h1>Personel İade Talepleri (${records.length}${records.length !== allRecords.length ? ` / ${allRecords.length}` : ""})</h1>
 
     <div class="ozet-grid">
@@ -1694,6 +1696,7 @@ app.get("/admin/personel-iade/:id", async (req, res) => {
     <style>${ADMIN_PAGE_STYLE}</style>
     </head>
     <body>
+    <p style="text-align:right;margin:0"><a href="/admin/logout" style="font-size:0.85em;color:#777">Çıkış Yap</a></p>
     <h1>İade Talebi ${personelIadeBadge(record.durum)}</h1>
     <table>
     <tr><th>Tarih</th><td>${new Date(record.timestamp).toLocaleString("tr-TR")}</td></tr>
@@ -1812,11 +1815,10 @@ async function runPersonelIadeReminderCheck() {
         }
         if (gecikenler.length === 0) return;
 
-        const key = ADMIN_ACCESS_KEY || "";
         const satirlar = gecikenler
             .map((r) => {
                 const saat = Math.floor((now - r.timestamp) / (60 * 60 * 1000));
-                return `<tr><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(r.personelAdi)}</td><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(r.musteriAdi)}</td><td style="padding:6px 10px;border:1px solid #ddd">${saat} saat</td><td style="padding:6px 10px;border:1px solid #ddd"><a href="${PUBLIC_URL}/admin/personel-iade/${r.id}?key=${key}">İncele</a></td></tr>`;
+                return `<tr><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(r.personelAdi)}</td><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(r.musteriAdi)}</td><td style="padding:6px 10px;border:1px solid #ddd">${saat} saat</td><td style="padding:6px 10px;border:1px solid #ddd"><a href="${PUBLIC_URL}/admin/personel-iade/${r.id}">İncele</a></td></tr>`;
             })
             .join("");
         const html = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222">
@@ -1826,7 +1828,7 @@ async function runPersonelIadeReminderCheck() {
             <tr><th style="padding:6px 10px;border:1px solid #ddd;background:#f7f7f7">Personel</th><th style="padding:6px 10px;border:1px solid #ddd;background:#f7f7f7">Müşteri</th><th style="padding:6px 10px;border:1px solid #ddd;background:#f7f7f7">Bekleme Süresi</th><th style="padding:6px 10px;border:1px solid #ddd;background:#f7f7f7"></th></tr>
             ${satirlar}
             </table>
-            <p style="margin-top:16px"><a href="${PUBLIC_URL}/admin/personel-iade-talepleri?key=${key}">Tüm talepleri gör &rarr;</a></p>
+            <p style="margin-top:16px"><a href="${PUBLIC_URL}/admin/personel-iade-talepleri">Tüm talepleri gör &rarr;</a></p>
         </div>`;
         await sendBrevoMail({
             toEmail: PERSONEL_IADE_MAIL_TO,
@@ -1836,7 +1838,7 @@ async function runPersonelIadeReminderCheck() {
         });
         notifyAdmin(
             `⏰ <b>${gecikenler.length} bekleyen personel iade talebi 24 saatten uzun süredir onay bekliyor.</b>\n` +
-            `${PUBLIC_URL}/admin/personel-iade-talepleri?key=${key}`
+            `${PUBLIC_URL}/admin/personel-iade-talepleri`
         );
 
         await Promise.all(
@@ -2121,7 +2123,7 @@ if (postback?.payload === "QR_DEALER") {
     notifyAdmin(
         `🏢 <b>Bayilik İlgisi - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n\n` +
-        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}`
     );
     return;
 }
@@ -2142,7 +2144,7 @@ if (postback?.payload === "QR_SUPPORT") {
     notifyAdmin(
         `🛠️ <b>Teknik Destek Talebi - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n\n` +
-        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}`
     );
     return;
 }
@@ -2160,7 +2162,7 @@ if (postback?.payload === "QR_RETURN") {
     notifyAdmin(
         `🔄 <b>İade/Garanti Talebi - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n\n` +
-        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}`
     );
     return;
 }
@@ -2182,7 +2184,7 @@ if (postback?.payload === CAMPAIGN_INTERESTED_PAYLOAD || postback?.payload === C
         `${interested ? "✅" : "🚫"} <b>Kampanya Yaniti - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n` +
         `Yanit: ${interested ? "Ilgileniyorum" : "Ilgilenmiyorum"}\n\n` +
-        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}`
     );
     return;
 }
@@ -2195,7 +2197,7 @@ if (whatsapp) {
         `🔔 <b>Stok/Fiyat Sorusu - Instagram DM</b>\n` +
         `Musteri: ${escapeHtml(senderId)}\n` +
         `Mesaj: ${escapeHtml(incomingText)}\n\n` +
-        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}`
     );
 } else {
     await sendDirectReply(senderId, text);
@@ -2208,7 +2210,7 @@ if (needsHuman) {
         `Musteri: ${escapeHtml(senderId)}\n` +
         `Sebep: ${handoffReason === "istek" ? "Musteri gercek biriyle gorusmek istedi" : "Bot anlamli bir cevap uretemedi (hata/bos yanit)"}\n` +
         `Mesaj: ${escapeHtml(incomingText)}\n\n` +
-        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(senderId)}`
     );
 }
 
@@ -2261,7 +2263,7 @@ if (whatsapp) {
         `Yazan: ${escapeHtml(commenterId)}\n` +
         `Yorum: ${escapeHtml(commentText)}\n` +
         `(Yorum cevabinin yanina ozel DM de gonderildi)\n\n` +
-        `Konusmayi gor: ${PUBLIC_URL}/panel/comment/${encodeURIComponent(commenterId)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor: ${PUBLIC_URL}/panel/comment/${encodeURIComponent(commenterId)}`
     );
 }
 
@@ -2271,7 +2273,7 @@ if (needsHuman) {
         `Yazan: ${escapeHtml(commenterId)}\n` +
         `Sebep: ${handoffReason === "istek" ? "Musteri gercek biriyle gorusmek istedi" : "Bot anlamli bir cevap uretemedi (hata/bos yanit)"}\n` +
         `Yorum: ${escapeHtml(commentText)}\n\n` +
-        `Konusmayi gor: ${PUBLIC_URL}/panel/comment/${encodeURIComponent(commenterId)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor: ${PUBLIC_URL}/panel/comment/${encodeURIComponent(commenterId)}`
     );
 }
 }
@@ -2381,7 +2383,7 @@ if (buttonReply?.id === CAMPAIGN_INTERESTED_PAYLOAD || buttonReply?.id === CAMPA
         `${interested ? "✅" : "🚫"} <b>Kampanya Yaniti - WhatsApp</b>\n` +
         `Numara: ${escapeHtml(from)}\n` +
         `Yanit: ${interested ? "Ilgileniyorum" : "Ilgilenmiyorum"}\n\n` +
-        `Konusmayi gor: ${PUBLIC_URL}/panel/whatsapp/${encodeURIComponent(from)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor: ${PUBLIC_URL}/panel/whatsapp/${encodeURIComponent(from)}`
     );
     return;
 }
@@ -2440,7 +2442,7 @@ if (needsHuman) {
         `Musteri: ${escapeHtml(from)}\n` +
         `Sebep: ${handoffReason === "istek" ? "Musteri gercek biriyle gorusmek istedi" : "Bot anlamli bir cevap uretemedi (hata/bos yanit)"}\n` +
         `Mesaj: ${escapeHtml(text)}\n` +
-        `Konusmayi gor ve cevap yaz: ${PUBLIC_URL}/panel/whatsapp/${encodeURIComponent(from)}?key=${ADMIN_ACCESS_KEY || ""}`
+        `Konusmayi gor ve cevap yaz: ${PUBLIC_URL}/panel/whatsapp/${encodeURIComponent(from)}`
     );
 }
 
@@ -3107,17 +3109,150 @@ async function broadcastToAllWhatsAppCustomers(message, imageUrl, statusFilter, 
     return { total: recipientIds.length, sent, failed, results };
 }
 
+const ADMIN_SESSION_COOKIE = "wintek_admin_oturum";
+const ADMIN_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60; // 30 gun
+
+// Ek npm paketi gerektirmeyen basit cookie ayristirici.
+function parseCookies(req) {
+    const header = req.headers?.cookie;
+    const out = {};
+    if (!header) return out;
+    header.split(";").forEach((part) => {
+        const idx = part.indexOf("=");
+        if (idx === -1) return;
+        const k = part.slice(0, idx).trim();
+        const v = part.slice(idx + 1).trim();
+        if (k) {
+            try {
+                out[k] = decodeURIComponent(v);
+            } catch {
+                out[k] = v;
+            }
+        }
+    });
+    return out;
+}
+
+// HMAC-SHA256 ile imzali, sureli oturum tokeni. Sir olarak ADMIN_ACCESS_KEY kullanilir.
+function createAdminSessionToken() {
+    const expiresAt = Date.now() + ADMIN_SESSION_MAX_AGE_SECONDS * 1000;
+    const sig = crypto.createHmac("sha256", ADMIN_ACCESS_KEY).update(String(expiresAt)).digest("hex");
+    return `${expiresAt}.${sig}`;
+}
+
+function verifyAdminSessionToken(token) {
+    if (!token || !ADMIN_ACCESS_KEY) return false;
+    const parts = String(token).split(".");
+    if (parts.length !== 2) return false;
+    const [expiresAtStr, sig] = parts;
+    const expiresAt = Number(expiresAtStr);
+    if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return false;
+    const expectedSig = crypto.createHmac("sha256", ADMIN_ACCESS_KEY).update(expiresAtStr).digest("hex");
+    let a, b;
+    try {
+        a = Buffer.from(sig, "hex");
+        b = Buffer.from(expectedSig, "hex");
+    } catch {
+        return false;
+    }
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+}
+
+function setAdminSessionCookie(res) {
+    const token = createAdminSessionToken();
+    res.setHeader(
+        "Set-Cookie",
+        `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${ADMIN_SESSION_MAX_AGE_SECONDS}`
+    );
+}
+
+function clearAdminSessionCookie(res) {
+    res.setHeader("Set-Cookie", `${ADMIN_SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`);
+}
+
+// Acik yonlendirme (open redirect) olmasin diye sadece site-ici, "/" ile baslayan
+// ve "//" ile baslamayan adreslere izin veriyoruz.
+function guvenliDonusAdresi(deger, varsayilan = "/admin/personel-iade-talepleri") {
+    if (typeof deger === "string" && deger.startsWith("/") && !deger.startsWith("//")) {
+        return deger;
+    }
+    return varsayilan;
+}
+
 function checkAdminKey(req, res) {
     if (!ADMIN_ACCESS_KEY) {
         res.status(503).send("ADMIN_ACCESS_KEY sunucuda tanimli degil. Once Render'da bu ortam degiskenini olusturun.");
         return false;
     }
-    if (req.query.key !== ADMIN_ACCESS_KEY && req.body?.key !== ADMIN_ACCESS_KEY) {
-        res.status(403).send("Yetkisiz erisim: gecersiz veya eksik anahtar.");
-        return false;
+    const cookies = parseCookies(req);
+    if (verifyAdminSessionToken(cookies[ADMIN_SESSION_COOKIE])) {
+        return true;
     }
-    return true;
+    if (req.query.key === ADMIN_ACCESS_KEY || req.body?.key === ADMIN_ACCESS_KEY) {
+        // Eskiden gonderilmis ?key= linkleri hala calisir; ilk kullanimda guvenli
+        // bir oturum cerezine yukseltilir ki anahtar tekrar tekrar acikta gitmesin.
+        setAdminSessionCookie(res);
+        return true;
+    }
+    const donusHedefi = guvenliDonusAdresi(req.originalUrl);
+    res.redirect(`/admin/login?donus=${encodeURIComponent(donusHedefi)}`);
+    return false;
 }
+
+app.get("/admin/login", (req, res) => {
+    const donus = guvenliDonusAdresi(req.query.donus);
+    const hataVar = req.query.hata === "1";
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Yönetici Girişi - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>${ADMIN_PAGE_STYLE}
+    .login-kutu { max-width: 360px; margin: 80px auto 0; }
+    .login-hata { background: #ffebee; color: #b71c1c; padding: 10px 14px; border-radius: 6px; margin-top: 16px; }
+    </style>
+    </head>
+    <body>
+    <div class="login-kutu">
+    <h1>Yönetici Girişi</h1>
+    <p class="intro">Devam etmek için yönetici şifresini girin.</p>
+    ${hataVar ? `<div class="login-hata">Şifre hatalı. Lütfen tekrar deneyin.</div>` : ""}
+    <form method="POST" action="/admin/login">
+        <input type="hidden" name="donus" value="${escapeHtml(donus)}">
+        <label>Şifre</label>
+        <input type="password" name="sifre" autofocus required>
+        <button type="submit" class="btn btn-onayla">Giriş Yap</button>
+    </form>
+    </div>
+    </body>
+    </html>`);
+});
+
+app.post("/admin/login", (req, res) => {
+    const donus = guvenliDonusAdresi(req.body?.donus);
+    if (!ADMIN_ACCESS_KEY) {
+        res.status(503).send("ADMIN_ACCESS_KEY sunucuda tanimli degil. Once Render'da bu ortam degiskenini olusturun.");
+        return;
+    }
+    const girilenSifre = String(req.body?.sifre || "");
+    const a = Buffer.from(girilenSifre);
+    const b = Buffer.from(ADMIN_ACCESS_KEY);
+    const gecerli = a.length === b.length && crypto.timingSafeEqual(a, b);
+    if (!gecerli) {
+        res.redirect(`/admin/login?hata=1&donus=${encodeURIComponent(donus)}`);
+        return;
+    }
+    setAdminSessionCookie(res);
+    res.redirect(donus);
+});
+
+app.get("/admin/logout", (req, res) => {
+    clearAdminSessionCookie(res);
+    res.redirect("/admin/login");
+});
 
 app.get("/broadcast", (req, res) => {
     if (!checkAdminKey(req, res)) return;
@@ -3535,7 +3670,7 @@ async function runInterestedFollowupCheck() {
                 notifyAdmin(
                     `📨 <b>Otomatik Takip Mesaji Gonderildi</b>\n` +
                     `Musteri: ${escapeHtml(id)} (Ilgileniyor, 24 saat cevapsiz)\n\n` +
-                    `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(id)}?key=${ADMIN_ACCESS_KEY || ""}`
+                    `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(id)}`
                 );
             } else {
                 console.error(`Ilgileniyor takip mesaji gonderilemedi -> ${id}: ${result.reason}`);
@@ -3613,7 +3748,7 @@ async function runSatisfactionFollowupCheck() {
                 notifyAdmin(
                     `✅ <b>Satış Sonrası Memnuniyet Mesajı Gönderildi</b>\n` +
                     `Musteri: ${escapeHtml(id)} (Satisa Dondu)\n\n` +
-                    `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(id)}?key=${ADMIN_ACCESS_KEY || ""}`
+                    `Konusmayi gor: ${PUBLIC_URL}/panel/dm/${encodeURIComponent(id)}`
                 );
             } else {
                 console.error(`Satis sonrasi memnuniyet mesaji gonderilemedi -> ${id}: ${result.reason}`);
@@ -3791,7 +3926,7 @@ async function buildWeeklyReportMessage(weekKey) {
         text += `🔥 En çok sorulan ürünler: bu hafta belirgin bir ürün sorusu olmadı.`;
     }
 
-    text += `\nPaneli gör: ${PUBLIC_URL}/panel?key=${ADMIN_ACCESS_KEY || ""}`;
+    text += `\nPaneli gör: ${PUBLIC_URL}/panel`;
 
     return text.trim();
 }

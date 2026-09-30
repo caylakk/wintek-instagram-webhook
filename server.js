@@ -5,6 +5,7 @@ const Anthropic = require("@anthropic-ai/sdk");
 const { Redis } = require("@upstash/redis");
 const multer = require("multer");
 const XLSX = require("xlsx");
+const crypto = require("crypto");
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 // BizimHesap'tan disa aktarilan ve manuel yuklenen WhatsApp musterileri bu
@@ -57,6 +58,16 @@ const FORM_REQUESTS_MAX = 500;
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const MAIL_TO = process.env.MAIL_TO || "info@wintekgroup.com.tr";
 const MAIL_FROM = process.env.MAIL_FROM || "info@wintekgroup.com.tr";
+
+// --- Personel Iade Talep Formu -------------------------------------------------
+// Personel musteriden aldigi iadeyi bu formdan bildirir. Talep once muhasebeye
+// mail olarak gider; muhasebe admin panelinden Onayla/Reddet der. Onaylanirsa
+// personelin (aktif listedeki) mailine kisa bir onay bildirimi gider.
+const PERSONEL_IADE_FORM_URL = `${PUBLIC_URL}/personel-iade-talep`;
+const PERSONEL_IADE_MAIL_TO = process.env.PERSONEL_IADE_MAIL_TO || "muhasebe@wintekgroup.com.tr";
+const PERSONEL_LISTESI_KEY = "personel:liste"; // JSON dizi: [{isim, eposta}, ...]
+const PERSONEL_IADE_TALEPLER_KEY = "personel:iade:talepler"; // Redis hash: id -> JSON kayit
+const PERSONEL_IADE_TALEPLER_MAX = 1000;
 // WhatsApp karsilama menusundeki butonlarin kimlikleri
 const WA_MENU_SUPPORT = "WA_MENU_SUPPORT";
 const WA_MENU_RETURN = "WA_MENU_RETURN";
@@ -747,6 +758,88 @@ async function handleFormSubmission({ type, emoji, title, fields, adSoyad, epost
 const clean = (v, max = 2000) => String(v || "").trim().slice(0, max);
 const isValidEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || ""));
 
+// Brevo uzerinden serbest (herhangi bir aliciya) mail gonderen genel yardimci.
+// sendFormEmail'den farkli olarak sabit MAIL_TO'ya degil, verilen adrese gider.
+async function sendBrevoMail({ toEmail, toName, subject, html, replyToEmail, replyToName }) {
+    if (!BREVO_API_KEY) {
+        console.warn(`BREVO_API_KEY tanimli degil - mail gonderilmedi (${subject}).`);
+        return false;
+    }
+    if (!isValidEmail(toEmail)) {
+        console.warn(`Gecersiz alici adresi, mail gonderilmedi (${subject}): ${toEmail}`);
+        return false;
+    }
+    const body = {
+        sender: { name: "Wintek Form", email: MAIL_FROM },
+        to: [{ email: toEmail, name: toName || toEmail }],
+        subject,
+        htmlContent: html,
+    };
+    if (replyToEmail && isValidEmail(replyToEmail)) {
+        body.replyTo = { email: replyToEmail, name: replyToName || replyToEmail };
+    }
+    try {
+        await axios.post("https://api.brevo.com/v3/smtp/email", body, {
+            headers: { "api-key": BREVO_API_KEY, "content-type": "application/json", accept: "application/json" },
+            timeout: 15000,
+        });
+        console.log(`Mail gonderildi -> ${toEmail}: ${subject}`);
+        return true;
+    } catch (err) {
+        console.error("Mail gonderilemedi:", err.response?.status || "", err.response?.data || err.message);
+        return false;
+    }
+}
+
+// --- Personel listesi (isim -> eposta), tek bir Redis anahtarinda JSON dizi olarak. ---
+async function getPersonelListesi() {
+    if (!redis) return [];
+    try {
+        const raw = await redis.get(PERSONEL_LISTESI_KEY);
+        if (!raw) return [];
+        const list = typeof raw === "string" ? JSON.parse(raw) : raw;
+        return Array.isArray(list) ? list : [];
+    } catch (err) {
+        console.error("Personel listesi okunamadi:", err.message);
+        return [];
+    }
+}
+
+async function savePersonelListesi(list) {
+    if (!redis) return false;
+    try {
+        await redis.set(PERSONEL_LISTESI_KEY, JSON.stringify(list));
+        return true;
+    } catch (err) {
+        console.error("Personel listesi kaydedilemedi:", err.message);
+        return false;
+    }
+}
+
+// --- Personel iade talepleri, id -> JSON kayit seklinde bir Redis hash'inde. ---
+async function getPersonelIadeTalep(id) {
+    if (!redis) return null;
+    try {
+        const raw = await redis.hget(PERSONEL_IADE_TALEPLER_KEY, id);
+        if (!raw) return null;
+        return typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch (err) {
+        console.error("Personel iade talebi okunamadi:", err.message);
+        return null;
+    }
+}
+
+async function savePersonelIadeTalep(record) {
+    if (!redis) return false;
+    try {
+        await redis.hset(PERSONEL_IADE_TALEPLER_KEY, { [record.id]: JSON.stringify(record) });
+        return true;
+    } catch (err) {
+        console.error("Personel iade talebi kaydedilemedi:", err.message);
+        return false;
+    }
+}
+
 app.get("/teknik-destek", (req, res) => {
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send(renderFormPage({
@@ -1057,6 +1150,376 @@ app.get("/admin/bayilik-basvurulari", async (req, res) => {
     </table>
     </body>
     </html>`);
+});
+
+// =================================================================================
+// PERSONEL IADE TALEP FORMU
+// Akis: Personel formu doldurur -> muhasebeye mail gider (Onayla/Reddet linkli) ->
+// muhasebe admin panelinden karar verir -> Onaylanirsa personelin (aktif listedeki)
+// mailine kisa bir bildirim gider.
+// =================================================================================
+
+const ADMIN_PAGE_STYLE = `
+    body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+    h1 { font-size: 1.4em; margin-bottom: 4px; }
+    p.intro { color: #555; margin-top: 0; }
+    label { display: block; margin-top: 16px; font-weight: bold; }
+    input[type=text], input[type=tel], input[type=email], input[type=date], input[type=number], select { width: 100%; font-size: 1em; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; background: #fff; }
+    textarea { width: 100%; min-height: 100px; font-size: 1em; font-family: inherit; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; }
+    button, .btn { margin-top: 20px; padding: 12px 24px; font-size: 1em; border: none; border-radius: 6px; cursor: pointer; }
+    .btn-onayla { background: #2e7d32; color: #fff; }
+    .btn-reddet { background: #d32f2f; color: #fff; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 0.92em; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; vertical-align: top; }
+    th { background: #f5f5f5; }
+    .badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.82em; font-weight: bold; }
+    .badge-beklemede { background: #fff4e5; color: #a35a00; }
+    .badge-onaylandi { background: #e8f5e9; color: #1b5e20; }
+    .badge-reddedildi { background: #ffebee; color: #b71c1c; }
+    a { color: #1565c0; }`;
+
+function personelIadeBadge(durum) {
+    const map = { beklemede: "Beklemede", onaylandi: "Onaylandı", reddedildi: "Reddedildi" };
+    return `<span class="badge badge-${escapeHtml(durum)}">${escapeHtml(map[durum] || durum)}</span>`;
+}
+
+// --- Admin: aktif personel listesini (isim + eposta) yonetme sayfasi. ---
+app.get("/admin/personel-listesi", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const key = escapeHtml(req.query.key);
+    const personeller = await getPersonelListesi();
+    const rows = personeller
+        .map(
+            (p, i) => `<tr>
+            <td>${escapeHtml(p.isim)}</td>
+            <td>${escapeHtml(p.eposta)}</td>
+            <td><form method="POST" action="/admin/personel-listesi?key=${key}" style="margin:0" onsubmit="return confirm('${escapeHtml(p.isim)} silinsin mi?');">
+                <input type="hidden" name="action" value="sil">
+                <input type="hidden" name="index" value="${i}">
+                <button type="submit" class="btn btn-reddet" style="margin:0;padding:6px 14px;font-size:0.85em;">Sil</button>
+            </form></td>
+            </tr>`
+        )
+        .join("");
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Personel Listesi - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>${ADMIN_PAGE_STYLE}</style>
+    </head>
+    <body>
+    <h1>Personel Listesi</h1>
+    <p class="intro">Burada eklenen personel, "Wintek İade Talep Formu"nda isim olarak seçilebilir ve iade onaylandığında bildirim maili bu adrese gider.</p>
+    <table>
+    <tr><th>İsim</th><th>E-posta</th><th></th></tr>
+    ${rows || `<tr><td colspan="3">Henüz personel eklenmedi.</td></tr>`}
+    </table>
+    <form method="POST" action="/admin/personel-listesi?key=${key}">
+    <input type="hidden" name="action" value="ekle">
+    <label for="isim">Yeni Personel Adı</label>
+    <input type="text" name="isim" id="isim" required>
+    <label for="eposta">E-posta</label>
+    <input type="email" name="eposta" id="eposta" required>
+    <button type="submit" class="btn btn-onayla">Ekle</button>
+    </form>
+    <p style="margin-top:24px"><a href="/personel-iade-talep">İade talep formunu görüntüle &rarr;</a></p>
+    </body>
+    </html>`);
+});
+
+app.post("/admin/personel-listesi", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const key = escapeHtml(req.query.key || req.body.key);
+    const personeller = await getPersonelListesi();
+
+    if (req.body.action === "ekle") {
+        const isim = clean(req.body.isim, 120);
+        const eposta = clean(req.body.eposta, 120);
+        if (isim && isValidEmail(eposta)) {
+            personeller.push({ isim, eposta });
+            await savePersonelListesi(personeller);
+        }
+    } else if (req.body.action === "sil") {
+        const index = parseInt(req.body.index, 10);
+        if (Number.isInteger(index) && index >= 0 && index < personeller.length) {
+            personeller.splice(index, 1);
+            await savePersonelListesi(personeller);
+        }
+    }
+    res.redirect(`/admin/personel-listesi?key=${key}`);
+});
+
+// --- Personel icin: "Wintek Iade Talep Formu" ---
+app.get("/personel-iade-talep", async (req, res) => {
+    const personeller = await getPersonelListesi();
+    const personelOptions = personeller
+        .map((p) => `<option value="${escapeHtml(p.isim)}">${escapeHtml(p.isim)}</option>`)
+        .join("");
+    const uyari = personeller.length === 0
+        ? `<div class="warn" style="background:#fff4e5;border:1px solid #ffb74d;padding:12px;border-radius:6px;margin-top:16px;font-size:0.92em;">Henüz aktif personel listesi tanımlanmamış. Lütfen önce <a href="/admin/personel-listesi">personel listesine</a> personel ekleyin.</div>`
+        : "";
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Wintek İade Talep Formu</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>${FORM_PAGE_STYLE}</style>
+    </head>
+    <body>
+    <img src="${WINTEK_LOGO_DATA_URI}" alt="Wintek" style="display:block; max-width:220px; height:auto; margin:0 auto 24px;">
+    <h1>Wintek İade Talep Formu</h1>
+    <p class="intro">Müşteriden aldığınız iadeyi bu formdan bildirin; talep muhasebeye iletilecek ve onaylandığında size bildirim gelecek.</p>
+    ${uyari}
+    <form method="POST" action="/personel-iade-talep">
+    <label for="personelAdi">Personel Adı <span class="req">*</span></label>
+    <select name="personelAdi" id="personelAdi" required>
+        <option value="">Seçiniz</option>
+        ${personelOptions}
+    </select>
+    <label for="musteriAdi">Müşteri Adı Soyadı <span class="req">*</span></label>
+    <input type="text" name="musteriAdi" id="musteriAdi" required>
+    <label for="musteriTelefon">Müşteri Telefon <span class="req">*</span></label>
+    <input type="tel" name="musteriTelefon" id="musteriTelefon" required>
+    <label for="urun">Ürün Adı / Kodu <span class="req">*</span></label>
+    <input type="text" name="urun" id="urun" required>
+    <label for="siparisNo">Fatura / Sipariş No</label>
+    <input type="text" name="siparisNo" id="siparisNo">
+    <label for="tutar">Tutar (TL)</label>
+    <input type="text" name="tutar" id="tutar" placeholder="örn. 350">
+    <label for="aciklama">İade Nedeni / Açıklama <span class="req">*</span></label>
+    <textarea name="aciklama" id="aciklama" placeholder="İade sebebini kısaca açıklayın." required></textarea>
+    <button type="submit">Talebi Gönder</button>
+    </form>
+    </body>
+    </html>`);
+});
+
+app.post("/personel-iade-talep", async (req, res) => {
+    const personelAdi = clean(req.body.personelAdi, 120);
+    const musteriAdi = clean(req.body.musteriAdi, 120);
+    const musteriTelefon = clean(req.body.musteriTelefon, 40);
+    const urun = clean(req.body.urun, 200);
+    const siparisNo = clean(req.body.siparisNo, 80);
+    const tutar = clean(req.body.tutar, 40);
+    const aciklama = clean(req.body.aciklama);
+
+    if (!personelAdi || !musteriAdi || !musteriTelefon || !urun || !aciklama) {
+        res.status(400).send("Lütfen zorunlu alanları doldurup tekrar deneyin.");
+        return;
+    }
+
+    const id = crypto.randomUUID();
+    const record = {
+        id,
+        personelAdi,
+        musteriAdi,
+        musteriTelefon,
+        urun,
+        siparisNo,
+        tutar,
+        aciklama,
+        durum: "beklemede",
+        timestamp: Date.now(),
+    };
+    await savePersonelIadeTalep(record);
+    // Kayit listesini de guncel tutalim (admin listeleme sayfasi icin sirali id listesi).
+    if (redis) {
+        try {
+            await redis.lpush(`${PERSONEL_IADE_TALEPLER_KEY}:sira`, id);
+            await redis.ltrim(`${PERSONEL_IADE_TALEPLER_KEY}:sira`, 0, PERSONEL_IADE_TALEPLER_MAX - 1);
+        } catch (err) {
+            console.error("Personel iade talep sirasi kaydedilemedi:", err.message);
+        }
+    }
+
+    const detayUrl = `${PUBLIC_URL}/admin/personel-iade/${id}?key=${ADMIN_ACCESS_KEY || ""}`;
+    const fieldsHtml = [
+        ["Personel", personelAdi],
+        ["Müşteri", musteriAdi],
+        ["Müşteri Telefon", musteriTelefon],
+        ["Ürün", urun],
+        ["Fatura / Sipariş No", siparisNo],
+        ["Tutar", tutar],
+        ["Açıklama", aciklama],
+    ]
+        .filter(([, v]) => v)
+        .map(([k, v]) => `<tr><td style="padding:8px 12px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7;vertical-align:top;white-space:nowrap">${escapeHtml(k)}</td><td style="padding:8px 12px;border:1px solid #ddd;white-space:pre-wrap">${escapeHtml(v)}</td></tr>`)
+        .join("");
+    const html = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222">
+        <h2 style="color:#d32f2f;margin:0 0 12px">Yeni İade Talebi - ${escapeHtml(personelAdi)}</h2>
+        <table style="border-collapse:collapse">${fieldsHtml}</table>
+        <p style="margin-top:20px"><a href="${detayUrl}" style="display:inline-block;padding:10px 20px;background:#d32f2f;color:#fff;text-decoration:none;border-radius:6px;">İncele / Onayla</a></p>
+        <p style="color:#777;font-size:12px;margin-top:16px">Bu mail Wintek personel iade talep formundan otomatik olarak gönderildi.</p>
+    </div>`;
+    await sendBrevoMail({
+        toEmail: PERSONEL_IADE_MAIL_TO,
+        toName: "Wintek Muhasebe",
+        subject: `İade Talebi - ${personelAdi} (${musteriAdi})`,
+        html,
+    });
+    notifyAdmin(
+        `🧾 <b>Yeni Personel İade Talebi</b>\nPersonel: ${escapeHtml(personelAdi)}\nMüşteri: ${escapeHtml(musteriAdi)}\nÜrün: ${escapeHtml(urun)}`
+    );
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(renderFormThanksPage("Talebiniz alındı", `Teşekkürler, ${musteriAdi} için girdiğiniz iade talebi muhasebeye iletildi. Onaylandığında size mail ile bildirim gelecek.`));
+});
+
+// --- Admin: tum personel iade taleplerinin listesi. ---
+app.get("/admin/personel-iade-talepleri", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const key = escapeHtml(req.query.key);
+
+    let ids = [];
+    if (redis) {
+        try {
+            ids = await redis.lrange(`${PERSONEL_IADE_TALEPLER_KEY}:sira`, 0, -1);
+        } catch (err) {
+            console.error("Personel iade talep sirasi okunamadi:", err.message);
+        }
+    }
+    const records = (await Promise.all(ids.map((id) => getPersonelIadeTalep(id)))).filter(Boolean);
+
+    const rows = records
+        .map(
+            (r) => `<tr>
+            <td>${new Date(r.timestamp).toLocaleString("tr-TR")}</td>
+            <td>${escapeHtml(r.personelAdi)}</td>
+            <td>${escapeHtml(r.musteriAdi)}</td>
+            <td>${escapeHtml(r.urun)}</td>
+            <td>${personelIadeBadge(r.durum)}</td>
+            <td><a href="/admin/personel-iade/${r.id}?key=${key}">Detay</a></td>
+            </tr>`
+        )
+        .join("");
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>Personel İade Talepleri - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>${ADMIN_PAGE_STYLE}</style>
+    </head>
+    <body>
+    <h1>Personel İade Talepleri (${records.length})</h1>
+    <table>
+    <tr><th>Tarih</th><th>Personel</th><th>Müşteri</th><th>Ürün</th><th>Durum</th><th></th></tr>
+    ${rows || `<tr><td colspan="6">Henüz talep yok.</td></tr>`}
+    </table>
+    <p style="margin-top:24px"><a href="/admin/personel-listesi?key=${key}">Personel listesini yönet &rarr;</a></p>
+    </body>
+    </html>`);
+});
+
+// --- Admin: tek bir talebin detayi + Onayla/Reddet aksiyonlari. ---
+app.get("/admin/personel-iade/:id", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const key = escapeHtml(req.query.key);
+    const record = await getPersonelIadeTalep(req.params.id);
+    if (!record) {
+        res.status(404).send("Talep bulunamadı.");
+        return;
+    }
+
+    const aksiyonlar = record.durum === "beklemede"
+        ? `<form method="POST" action="/admin/personel-iade/${record.id}/onayla?key=${key}" style="display:inline-block;margin-right:10px">
+             <button type="submit" class="btn btn-onayla">Onayla</button>
+           </form>
+           <form method="POST" action="/admin/personel-iade/${record.id}/reddet?key=${key}" style="display:inline-block" onsubmit="return confirm('Bu talep reddedilsin mi?');">
+             <button type="submit" class="btn btn-reddet">Reddet</button>
+           </form>`
+        : `<p>Bu talep zaten <strong>${personelIadeBadge(record.durum)}</strong> olarak işaretlenmiş${record.karar_tarihi ? ` (${new Date(record.karar_tarihi).toLocaleString("tr-TR")})` : ""}.</p>`;
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+    <html lang="tr">
+    <head>
+    <meta charset="UTF-8">
+    <title>İade Talebi Detayı - Wintek</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>${ADMIN_PAGE_STYLE}</style>
+    </head>
+    <body>
+    <h1>İade Talebi ${personelIadeBadge(record.durum)}</h1>
+    <table>
+    <tr><th>Tarih</th><td>${new Date(record.timestamp).toLocaleString("tr-TR")}</td></tr>
+    <tr><th>Personel</th><td>${escapeHtml(record.personelAdi)}</td></tr>
+    <tr><th>Müşteri</th><td>${escapeHtml(record.musteriAdi)}</td></tr>
+    <tr><th>Müşteri Telefon</th><td>${escapeHtml(record.musteriTelefon)}</td></tr>
+    <tr><th>Ürün</th><td>${escapeHtml(record.urun)}</td></tr>
+    <tr><th>Fatura / Sipariş No</th><td>${escapeHtml(record.siparisNo || "-")}</td></tr>
+    <tr><th>Tutar</th><td>${escapeHtml(record.tutar || "-")}</td></tr>
+    <tr><th>Açıklama</th><td style="white-space:pre-wrap">${escapeHtml(record.aciklama)}</td></tr>
+    </table>
+    ${aksiyonlar}
+    <p style="margin-top:24px"><a href="/admin/personel-iade-talepleri?key=${key}">&larr; Tüm talepler</a></p>
+    </body>
+    </html>`);
+});
+
+app.post("/admin/personel-iade/:id/onayla", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const key = escapeHtml(req.query.key || req.body.key);
+    const record = await getPersonelIadeTalep(req.params.id);
+    if (!record) {
+        res.status(404).send("Talep bulunamadı.");
+        return;
+    }
+    if (record.durum === "beklemede") {
+        record.durum = "onaylandi";
+        record.karar_tarihi = Date.now();
+        await savePersonelIadeTalep(record);
+
+        const personeller = await getPersonelListesi();
+        const personel = personeller.find(
+            (p) => p.isim.trim().toLocaleLowerCase("tr") === record.personelAdi.trim().toLocaleLowerCase("tr")
+        );
+        if (personel) {
+            const html = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222">
+                <h2 style="color:#2e7d32;margin:0 0 12px">İade Talebiniz Onaylandı ✅</h2>
+                <p><strong>${escapeHtml(record.musteriAdi)}</strong> için girdiğiniz iade talebi onaylandı.</p>
+                <table style="border-collapse:collapse">
+                <tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Ürün</td><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(record.urun)}</td></tr>
+                ${record.tutar ? `<tr><td style="padding:6px 10px;border:1px solid #ddd;font-weight:bold;background:#f7f7f7">Tutar</td><td style="padding:6px 10px;border:1px solid #ddd">${escapeHtml(record.tutar)}</td></tr>` : ""}
+                </table>
+                <p style="color:#777;font-size:12px;margin-top:16px">Bu mail Wintek personel iade sisteminden otomatik olarak gönderildi.</p>
+            </div>`;
+            await sendBrevoMail({
+                toEmail: personel.eposta,
+                toName: personel.isim,
+                subject: `İade Talebiniz Onaylandı - ${record.musteriAdi}`,
+                html,
+            });
+        } else {
+            console.warn(`Personel listesinde eslesme bulunamadi, onay maili gonderilemedi: "${record.personelAdi}"`);
+        }
+    }
+    res.redirect(`/admin/personel-iade/${record.id}?key=${key}`);
+});
+
+app.post("/admin/personel-iade/:id/reddet", async (req, res) => {
+    if (!checkAdminKey(req, res)) return;
+    const key = escapeHtml(req.query.key || req.body.key);
+    const record = await getPersonelIadeTalep(req.params.id);
+    if (!record) {
+        res.status(404).send("Talep bulunamadı.");
+        return;
+    }
+    if (record.durum === "beklemede") {
+        record.durum = "reddedildi";
+        record.karar_tarihi = Date.now();
+        await savePersonelIadeTalep(record);
+    }
+    res.redirect(`/admin/personel-iade/${record.id}?key=${key}`);
 });
 
 app.post("/webhook", (req, res) => {

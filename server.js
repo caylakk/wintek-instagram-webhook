@@ -1195,9 +1195,15 @@ const ADMIN_PAGE_STYLE = `
     .badge-reddedildi { background: #ffebee; color: #b71c1c; }
     a { color: #1565c0; }`;
 
+const PERSONEL_IADE_DURUM_ETIKETLERI = { beklemede: "Beklemede", onaylandi: "Onaylandı", reddedildi: "Reddedildi" };
 function personelIadeBadge(durum) {
-    const map = { beklemede: "Beklemede", onaylandi: "Onaylandı", reddedildi: "Reddedildi" };
-    return `<span class="badge badge-${escapeHtml(durum)}">${escapeHtml(map[durum] || durum)}</span>`;
+    return `<span class="badge badge-${escapeHtml(durum)}">${escapeHtml(PERSONEL_IADE_DURUM_ETIKETLERI[durum] || durum)}</span>`;
+}
+// CSV alanlarini RFC4180'e uygun sekilde kacisliyor (virgul/tirnak/satirici varsa tirnaklar).
+function csvKacis(v) {
+    const s = String(v ?? "");
+    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
 }
 
 // --- Admin: aktif personel listesini (isim + eposta) yonetme sayfasi. ---
@@ -1459,10 +1465,11 @@ app.post("/personel-iade-talep", (req, res, next) => {
     res.send(renderFormThanksPage("Talebiniz alındı", `Teşekkürler, ${musteriAdi} için girdiğiniz iade talebi muhasebeye iletildi. Onaylandığında size mail ile bildirim gelecek.`));
 });
 
-// --- Admin: tum personel iade taleplerinin listesi. ---
+// --- Admin: tum personel iade taleplerinin listesi (ozet panel + filtre + CSV disa aktarma). ---
 app.get("/admin/personel-iade-talepleri", async (req, res) => {
     if (!checkAdminKey(req, res)) return;
-    const key = escapeHtml(req.query.key);
+    const keyRaw = req.query.key || "";
+    const key = escapeHtml(keyRaw);
 
     let ids = [];
     if (redis) {
@@ -1472,7 +1479,86 @@ app.get("/admin/personel-iade-talepleri", async (req, res) => {
             console.error("Personel iade talep sirasi okunamadi:", err.message);
         }
     }
-    const records = (await Promise.all(ids.map((id) => getPersonelIadeTalep(id)))).filter(Boolean);
+    const allRecords = (await Promise.all(ids.map((id) => getPersonelIadeTalep(id)))).filter(Boolean);
+
+    // --- Ozet panel: bu ayki sayilar + tum zamanlarda en cok iade gelen urunler ---
+    const now = new Date();
+    const ayBaslangic = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+    const buAyKayitlar = allRecords.filter((r) => r.timestamp >= ayBaslangic);
+    const ozet = {
+        toplam: buAyKayitlar.length,
+        onaylandi: buAyKayitlar.filter((r) => r.durum === "onaylandi").length,
+        reddedildi: buAyKayitlar.filter((r) => r.durum === "reddedildi").length,
+        beklemede: buAyKayitlar.filter((r) => r.durum === "beklemede").length,
+    };
+    const urunSayaclari = {};
+    for (const r of allRecords) {
+        String(r.urun || "")
+            .split("\n")
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .forEach((u) => {
+                urunSayaclari[u] = (urunSayaclari[u] || 0) + 1;
+            });
+    }
+    const enCokUrunler = Object.entries(urunSayaclari)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5);
+
+    // --- Filtreler ---
+    const durumFiltre = clean(req.query.durum, 20);
+    const personelFiltre = clean(req.query.personel, 120);
+    const baslangicFiltre = clean(req.query.baslangic, 10);
+    const bitisFiltre = clean(req.query.bitis, 10);
+
+    let records = allRecords;
+    if (durumFiltre) records = records.filter((r) => r.durum === durumFiltre);
+    if (personelFiltre) {
+        const hedef = personelFiltre.trim().toLocaleLowerCase("tr");
+        records = records.filter((r) => (r.personelAdi || "").trim().toLocaleLowerCase("tr") === hedef);
+    }
+    if (baslangicFiltre) {
+        const ms = new Date(`${baslangicFiltre}T00:00:00`).getTime();
+        if (Number.isFinite(ms)) records = records.filter((r) => r.timestamp >= ms);
+    }
+    if (bitisFiltre) {
+        const ms = new Date(`${bitisFiltre}T23:59:59`).getTime();
+        if (Number.isFinite(ms)) records = records.filter((r) => r.timestamp <= ms);
+    }
+    records = records.slice().sort((a, b) => b.timestamp - a.timestamp);
+
+    // --- CSV disa aktarma: filtrelenmis kayitlar uzerinden, ayni sayfadan ---
+    if (req.query.format === "csv") {
+        const basliklar = ["Tarih", "Personel", "Musteri", "Musteri Telefon", "Urun", "Fatura/Siparis No", "Tutar", "Aciklama", "Durum", "Red Sebebi"];
+        const satirlar = records.map((r) =>
+            [
+                new Date(r.timestamp).toLocaleString("tr-TR"),
+                r.personelAdi,
+                r.musteriAdi,
+                r.musteriTelefon,
+                r.urun,
+                r.siparisNo || "",
+                r.tutar !== "" && r.tutar != null ? formatTutar(r.tutar) : "",
+                r.aciklama,
+                PERSONEL_IADE_DURUM_ETIKETLERI[r.durum] || r.durum,
+                r.redSebebi || "",
+            ]
+                .map(csvKacis)
+                .join(",")
+        );
+        const csv = "﻿" + [basliklar.map(csvKacis).join(","), ...satirlar].join("\r\n");
+        res.set("Content-Type", "text/csv; charset=utf-8");
+        res.set("Content-Disposition", `attachment; filename="personel-iade-talepleri.csv"`);
+        res.send(csv);
+        return;
+    }
+
+    const personeller = await getPersonelListesi();
+    const personelFiltreOptions = personeller
+        .map((p) => `<option value="${escapeHtml(p.isim)}"${personelFiltre === p.isim ? " selected" : ""}>${escapeHtml(p.isim)}</option>`)
+        .join("");
+    const durumOption = (v, etiket) => `<option value="${v}"${durumFiltre === v ? " selected" : ""}>${etiket}</option>`;
+    const filtreliMi = durumFiltre || personelFiltre || baslangicFiltre || bitisFiltre;
 
     const rows = records
         .map(
@@ -1494,13 +1580,72 @@ app.get("/admin/personel-iade-talepleri", async (req, res) => {
     <meta charset="UTF-8">
     <title>Personel İade Talepleri - Wintek</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>${ADMIN_PAGE_STYLE}</style>
+    <style>${ADMIN_PAGE_STYLE}
+    .ozet-grid { display: flex; gap: 12px; flex-wrap: wrap; margin: 20px 0; }
+    .ozet-kart { flex: 1; min-width: 130px; padding: 14px; border: 1px solid #ddd; border-radius: 8px; background: #f7f7f7; }
+    .ozet-kart .etiket { font-size: 0.8em; color: #777; }
+    .ozet-kart .deger { font-size: 1.6em; font-weight: bold; margin-top: 2px; }
+    .filtre-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin: 20px 0; }
+    .filtre-alan { min-width: 140px; }
+    .filtre-alan label { margin-top: 0; font-size: 0.85em; }
+    .filtre-alan select, .filtre-alan input { margin-top: 4px; }
+    .filtre-form button, .filtre-form a.btn-cizgili { margin-top: 0; }
+    </style>
     </head>
     <body>
-    <h1>Personel İade Talepleri (${records.length})</h1>
+    <h1>Personel İade Talepleri (${records.length}${records.length !== allRecords.length ? ` / ${allRecords.length}` : ""})</h1>
+
+    <div class="ozet-grid">
+      <div class="ozet-kart"><div class="etiket">Bu Ay Toplam Talep</div><div class="deger">${ozet.toplam}</div></div>
+      <div class="ozet-kart" style="background:#e8f5e9;border-color:#c8e6c9"><div class="etiket" style="color:#1b5e20">Onaylanan</div><div class="deger" style="color:#1b5e20">${ozet.onaylandi}</div></div>
+      <div class="ozet-kart" style="background:#ffebee;border-color:#ffcdd2"><div class="etiket" style="color:#b71c1c">Reddedilen</div><div class="deger" style="color:#b71c1c">${ozet.reddedildi}</div></div>
+      <div class="ozet-kart" style="background:#fff4e5;border-color:#ffe0b2"><div class="etiket" style="color:#a35a00">Beklemede</div><div class="deger" style="color:#a35a00">${ozet.beklemede}</div></div>
+    </div>
+    ${enCokUrunler.length > 0 ? `<div style="margin-bottom:8px">
+      <div style="font-weight:bold;margin-bottom:6px">En Çok İade Gelen Ürünler (tüm zamanlar)</div>
+      <ol style="margin:0;padding-left:20px">
+      ${enCokUrunler.map(([urun, adet]) => `<li>${escapeHtml(urun)} <span style="color:#777">(${adet} kez)</span></li>`).join("")}
+      </ol>
+    </div>` : ""}
+
+    <form method="GET" action="/admin/personel-iade-talepleri" class="filtre-form">
+      <input type="hidden" name="key" value="${key}">
+      <div class="filtre-alan">
+        <label for="durum">Durum</label>
+        <select name="durum" id="durum">
+          <option value="">Hepsi</option>
+          ${durumOption("beklemede", "Beklemede")}
+          ${durumOption("onaylandi", "Onaylandı")}
+          ${durumOption("reddedildi", "Reddedildi")}
+        </select>
+      </div>
+      <div class="filtre-alan">
+        <label for="personel">Personel</label>
+        <select name="personel" id="personel">
+          <option value="">Hepsi</option>
+          ${personelFiltreOptions}
+        </select>
+      </div>
+      <div class="filtre-alan">
+        <label for="baslangic">Başlangıç</label>
+        <input type="date" name="baslangic" id="baslangic" value="${escapeHtml(baslangicFiltre)}">
+      </div>
+      <div class="filtre-alan">
+        <label for="bitis">Bitiş</label>
+        <input type="date" name="bitis" id="bitis" value="${escapeHtml(bitisFiltre)}">
+      </div>
+      <div class="filtre-alan" style="min-width:auto">
+        <button type="submit" class="btn btn-onayla">Filtrele</button>
+      </div>
+      <div class="filtre-alan" style="min-width:auto">
+        <button type="submit" name="format" value="csv" class="btn" style="background:#555;color:#fff">⬇ CSV İndir</button>
+      </div>
+      ${filtreliMi ? `<div class="filtre-alan" style="min-width:auto"><a href="/admin/personel-iade-talepleri?key=${key}" class="btn-cizgili" style="display:inline-block;padding:10px 6px;color:#777">Filtreleri Temizle</a></div>` : ""}
+    </form>
+
     <table>
     <tr><th>Tarih</th><th>Personel</th><th>Müşteri</th><th>Ürün</th><th>Durum</th><th></th></tr>
-    ${rows || `<tr><td colspan="6">Henüz talep yok.</td></tr>`}
+    ${rows || `<tr><td colspan="6">${filtreliMi ? "Bu filtreyle eşleşen talep yok." : "Henüz talep yok."}</td></tr>`}
     </table>
     <p style="margin-top:24px"><a href="/admin/personel-listesi?key=${key}">Personel listesini yönet &rarr;</a></p>
     </body>
